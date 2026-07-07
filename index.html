@@ -245,10 +245,14 @@ const KINDS = {
 };
 const AI = [];
 /* 側線停放車輛 (裝飾)：八堵貨列、板橋電聯車 */
-AI.push({kind:'freight', dir:1, s:2540, len:KINDS.freight.cars*13, v:0,
-         x:-7.8, onMain:false, fixed:true});
-AI.push({kind:'emu', dir:1, s:15630, len:KINDS.emu.cars*20, v:0,
-         x:-7.8, onMain:false, fixed:true});
+function initParked(){
+  AI.length = 0;
+  AI.push({kind:'freight', dir:1, s:2540, len:KINDS.freight.cars*13, v:0,
+           x:-7.8, onMain:false, fixed:true});
+  AI.push({kind:'emu', dir:1, s:15630, len:KINDS.emu.cars*20, v:0,
+           x:-7.8, onMain:false, fixed:true});
+}
+initParked();
 
 function trainX(t, s){          // 每節車廂在里程 s 的橫向位置
   if(t.xPath){                  // 事件貨列：經渡線進南港側線
@@ -324,6 +328,7 @@ const S = {
   testSel: 0,                    // 測試選單游標
   annBanner: null,               // 廣播字幕 {text, ttl}
   annTempStop: false,            // 臨時停車廣播已播
+  escT: 0,                       // Esc 再按一次確認倒數
 };
 
 function msg(text, color){
@@ -479,7 +484,7 @@ window.addEventListener('keydown', e=>{
     }
     return;
   }
-  if(S.mode==='end'){ if(k==='Enter') location.reload(); return; }
+  if(S.mode==='end'){ if(k==='Enter'||k==='Escape') resetGame(); return; }
 
   switch(k){
     case 'ArrowUp': case 'w': case 'W':
@@ -504,8 +509,27 @@ window.addEventListener('keydown', e=>{
       if(S.v<0.05){ S.reverser*=-1;
         msg('換向器：'+(S.reverser>0?'前進':'後退'), S.reverser>0?'#9f9':'#fc6'); }
       break;
+    case 'Escape':                       // 返回標題畫面 (按兩次確認)
+      if(S.escT>0) resetGame();
+      else{ S.escT=2.5; msg('再按一次 Esc 返回標題畫面（目前進度將不保留）','#fc6'); }
+      break;
   }
 });
+
+function resetGame(){            // 返回標題畫面 (保留車種選擇)
+  try{ if(window.speechSynthesis) speechSynthesis.cancel(); }catch(e){}
+  setClass(CLS);                 // 重建時刻表與各站旗標
+  initParked();                  // 清除 AI 列車、重放側線車輛
+  S.mode='title'; S.t=T('07:59:40');
+  S.pos=60; S.v=0; S.notch=0; S.reverser=1;
+  S.doors='closed'; S.doorT=0; S.stationIdx=1; S.departReady=false;
+  S.score=0; S.ebLatch=false; S.atsWarn=false; S.atsTimer=0;
+  S.atsBeepT=0; S.atsPenalized=false;
+  S.msgs=[]; S.hint=''; S.endTimer=0;
+  S.nextSigIdx=0; S.nextOncoming=T('08:00:20');
+  S.freightSpawned=false; S.testMode=false; S.testSel=0;
+  S.annBanner=null; S.annTempStop=false; S.escT=0;
+}
 
 function startAt(i){             // 測試模式：自第 i 個停靠站出發
   const st = STOPS[i];
@@ -690,6 +714,8 @@ function update(dt){
     S.endTimer-=dt;
     if(S.endTimer<=0) S.mode='end';
   }
+
+  if(S.escT>0) S.escT -= dt;
 
   for(const m of S.msgs) m.ttl -= dt;
   S.msgs = S.msgs.filter(m=>m.ttl>0);
@@ -1269,7 +1295,7 @@ function drawHUD(){
   }
   /* 按鍵備忘 */
   ctx.textAlign='left'; ctx.fillStyle='#5a646e'; ctx.font=`${H*0.015}px sans-serif`;
-  ctx.fillText('↑加速  ↓煞車  E緊急  O車門  R換向  空白鍵鳴笛', W*0.02, H*0.985);
+  ctx.fillText('↑加速  ↓煞車  E緊急  O車門  R換向  空白鍵鳴笛  Esc×2返回標題', W*0.02, H*0.985);
   /* 測試模式徽章 */
   if(S.testMode){
     ctx.textAlign='center'; ctx.fillStyle='#8cf';
@@ -1398,7 +1424,7 @@ function drawEnd(){
   const pulse=0.6+0.4*Math.sin(performance.now()/350);
   ctx.fillStyle=`rgba(255,255,255,${pulse})`;
   ctx.font=`${UF*0.026}px sans-serif`;
-  ctx.fillText('按 Enter 再次出勤', W/2, H*0.88);
+  ctx.fillText('按 Enter 或 Esc 返回標題，再次出勤', W/2, H*0.88);
 }
 
 /* ---------------- 主迴圈 ---------------- */
