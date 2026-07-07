@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>臺鐵縱貫線 列車模擬駕駛</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#111;
+    font-family:"PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif;}
+  canvas{display:block;width:100vw;height:100vh;}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+/* ============================================================
+   臺鐵縱貫線 列車模擬駕駛 (BVE 風格)
+   區間車 1112 次 基隆 → 台北 (EMU500 型電聯車)
+   ============================================================ */
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, HOR = 0, FOC = 0, UF = 0;
+const CAMH = 2.8;               // 駕駛視點高度 (m)
+
+function resize(){
+  W = cv.width  = window.innerWidth;
+  H = cv.height = window.innerHeight;
+  HOR = H * 0.44;
+  FOC = H * 1.05;
+  UF = Math.min(H, W * 0.92);   // UI 字級基準 (兼容直向視窗)
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------------- 時刻工具 ---------------- */
+function T(str){ const a = str.split(':').map(Number); return a[0]*3600 + a[1]*60 + a[2]; }
+function fmt(t){
+  t = Math.max(0, Math.floor(t));
+  const p = n => String(n).padStart(2,'0');
+  return p(Math.floor(t/3600)) + ':' + p(Math.floor(t/60)%60) + ':' + p(t%60);
+}
+
+/* ---------------- 路線資料 ---------------- */
+const TRACK_LEN = 17900;
+
+const STATIONS = [
+  {name:'基隆', pos:60},
+  {name:'三坑', pos:960},
+  {name:'八堵', pos:2460},
+  {name:'七堵', pos:3860},
+  {name:'五堵', pos:5260},
+  {name:'汐止', pos:6460},
+  {name:'南港', pos:8660},
+  {name:'松山', pos:10260},
+  {name:'台北', pos:11860},
+  {name:'萬華', pos:13460},
+  {name:'板橋', pos:15560},
+  {name:'浮洲', pos:16560},
+  {name:'樹林', pos:17560},
+];
+STATIONS.forEach((s,i)=>{ s.idx=i; s.arrT=null; s.depT=null; s.served=(i===0);
+  s.failed=false; s.stopErr=null; s.arrErr=null; s.pts=null; s.bellDone=false; });
+
+/* ---------------- 車種 ---------------- */
+const CLASSES = {
+  local:{name:'區間車', trainNo:'1112 次', model:'EMU500 型電聯車',
+         a0:0.85, avgV:15.5, dwell:25,
+         stops:['基隆','三坑','八堵','七堵','五堵','汐止','南港','松山','台北','萬華','板橋','浮洲','樹林']},
+  ck:   {name:'莒光號', trainNo:'512 次', model:'E200 型機車牽引',
+         a0:0.55, avgV:19, dwell:30,
+         stops:['基隆','八堵','汐止','松山','台北','板橋','樹林']},
+  tc:   {name:'自強號', trainNo:'110 次', model:'EMU3000 型電聯車',
+         a0:0.95, avgV:21, dwell:30,
+         stops:['基隆','松山','台北']},
+};
+let CLS = 'local', STOPS = [];
+function setClass(key){                 // 選擇車種並生成時刻表
+  CLS = key;
+  const c = CLASSES[key];
+  STOPS = STATIONS.filter(s=>c.stops.includes(s.name));
+  STATIONS.forEach(s=>{ s.arrT=null; s.depT=null; s.served=false; s.failed=false;
+    s.stopErr=null; s.arrErr=null; s.pts=null; s.bellDone=false; s.annApproach=false; });
+  STATIONS[0].served = true;
+  let t = T('08:00:00');
+  STOPS.forEach((st,i)=>{
+    if(i===0){ st.depT=t; return; }
+    t += Math.ceil(((st.pos-STOPS[i-1].pos)/c.avgV + 35)/5)*5;
+    st.arrT = t;
+    if(i<STOPS.length-1){ st.depT = t + c.dwell; t = st.depT; }
+  });
+}
+setClass('local');
+
+const CURVES = [           // 半徑 R>0 右彎, R<0 左彎
+  {from:1850,  to:2350,  R:-600},
+  {from:4550,  to:5050,  R: 800},
+  {from:6850,  to:7650,  R:-1000},
+  {from:9350,  to:9850,  R: 700},
+  {from:11050, to:11450, R:-500},
+  {from:12800, to:13300, R: 700},
+  {from:14300, to:14900, R:-800},
+  {from:16150, to:16450, R: 600},
+];
+
+const LIMITS = [           // 各區間速限 (km/h)
+  {from:0,     limit:65},
+  {from:360,   limit:110},
+  {from:1960,  limit:80},
+  {from:2460,  limit:110},
+  {from:4460,  limit:90},
+  {from:5160,  limit:110},
+  {from:6760,  limit:95},
+  {from:7760,  limit:110},
+  {from:9260,  limit:90},
+  {from:9960,  limit:100},
+  {from:10960, limit:65},
+  {from:11560, limit:45},
+  {from:12160, limit:100},
+  {from:12760, limit:80},
+  {from:13310, limit:100},
+  {from:14260, limit:90},
+  {from:14910, limit:110},
+  {from:16110, limit:80},
+  {from:16460, limit:100},
+  {from:17060, limit:65},
+  {from:17360, limit:45},
+];
+
+function curvAt(s){
+  for(const c of CURVES) if(s>=c.from && s<c.to) return 1/c.R;
+  return 0;
+}
+function limitAt(s){
+  let l = LIMITS[0].limit;
+  for(const L of LIMITS) if(s>=L.from) l = L.limit;
+  return l;
+}
+function nextLimitChange(s){   // 前方降速預告
+  for(const L of LIMITS)
+    if(L.from > s && L.limit < limitAt(s)) return L;
+  return null;
+}
+
+/* 側線 (待避線)：八堵、南港、板橋 */
+const SIDINGS = [
+  {from:2150,  to:2550},
+  {from:8350,  to:8750},
+  {from:15250, to:15650},
+];
+function sidingX(s){           // 側線中心的橫向偏移，不在範圍內回傳 null
+  for(const sd of SIDINGS){
+    if(s<sd.from || s>sd.to) continue;
+    const t = Math.max(0, Math.min(1, (s-sd.from)/60, (sd.to-s)/60));
+    return -4.0 - 3.8*t;       // 兩端漸縮併入對向正線
+  }
+  return null;
+}
+
+/* 閉塞號誌 (自動區間號誌，設於右側) */
+const BLOCK_SIGS = [1560, 3060, 4360, 5860, 7060, 7460, 7860, 8260, 9460, 10660,
+                    12560, 13960, 14760, 16060, 16960];
+function blockBound(i){
+  return i+1 < BLOCK_SIGS.length ? BLOCK_SIGS[i+1] : TRACK_LEN;
+}
+function mainOccupied(a, b){   // 本線 (玩家同向正線) 於 [a,b] 是否有列車
+  for(const t of AI){
+    if(!t.onMain) continue;
+    const front = t.dir>0 ? t.s : t.s+t.len;
+    const rear  = t.dir>0 ? t.s-t.len : t.s;
+    if(front>a && rear<b) return true;
+  }
+  return false;
+}
+function blockAspect(i){       // 'R' 紅 / 'Y' 黃 / 'G' 綠
+  const a = BLOCK_SIGS[i], b = blockBound(i);
+  if(mainOccupied(a, b)) return 'R';
+  const b2 = i+2 < BLOCK_SIGS.length ? BLOCK_SIGS[i+2] : b+2000;
+  if(mainOccupied(b, b2)) return 'Y';
+  return 'G';
+}
+
+/* 預先積分軌道平面座標 */
+const TX  = new Float64Array(TRACK_LEN+2);
+const TZ  = new Float64Array(TRACK_LEN+2);
+const TTH = new Float64Array(TRACK_LEN+2);
+{
+  let th=0, x=0, z=0;
+  for(let i=0;i<=TRACK_LEN+1;i++){
+    TX[i]=x; TZ[i]=z; TTH[i]=th;
+    th += curvAt(i);
+    x += Math.sin(th);
+    z += Math.cos(th);
+  }
+}
+
+/* ---------------- 沿線物件 ---------------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;
+  let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;
+  return((t^t>>>14)>>>0)/4294967296;};}
+
+const BLDG_COLORS = [[176,168,158],[190,182,170],[158,152,148],[172,160,148],
+                     [148,150,158],[186,176,160],[164,158,166]];
+let OBJS = [];
+function buildScenery(){
+  const R = mulberry32(20260707);
+  OBJS = [];
+  for(let s=20; s<TRACK_LEN; s+=45) OBJS.push({t:'pole', s});
+  for(let s=8; s<TRACK_LEN; s+=18+R()*30){
+    const side = R()<0.5?-1:1;
+    OBJS.push({t:'tree', s, x: side<0 ? -(11.5+R()*6) : (6.5+R()*7), h:3+R()*3.5});
+  }
+  BLOCK_SIGS.forEach((p,i)=>OBJS.push({t:'blocksig', s:p, i}));
+  let s = 120;
+  while(s < TRACK_LEN-150){
+    const side = R()<0.5?-1:1;
+    OBJS.push({t:'bldg', s, x:side*(16+R()*38), w:8+R()*14,
+               h:4+R()*(4+11*s/TRACK_LEN),
+               c:BLDG_COLORS[(R()*BLDG_COLORS.length)|0]});
+    s += 28 + R()*(50 + (1-s/TRACK_LEN)*110);
+  }
+  OBJS.push({t:'bldg101', s:12080, x:-34, w:9, h:120});   // 遠方的台北101
+
+  for(const st of STATIONS){
+    for(let ps=Math.max(0,st.pos-105); ps<=st.pos+5; ps+=10)
+      OBJS.push({t:'plat', s:ps, s2:Math.min(ps+10, st.pos+10), st});
+    for(let ps=Math.max(0,st.pos-95); ps<=st.pos-15; ps+=16)
+      OBJS.push({t:'roof', s:ps, st});
+    OBJS.push({t:'board', s:st.pos-45, st});
+    OBJS.push({t:'stopSign', s:st.pos, st});
+    if(st.idx>0) OBJS.push({t:'signal', s:st.pos+40, st});
+  }
+  for(let i=1;i<LIMITS.length;i++)
+    OBJS.push({t:'limitSign', s:LIMITS[i].from, v:LIMITS[i].limit});
+  OBJS.sort((a,b)=>a.s-b.s);
+}
+buildScenery();
+
+/* ---------------- AI 列車 ---------------- */
+const KINDS = {
+  emu:    {cars:4,  carLen:20, hw:1.5, hTop:3.8, body:[70,105,168],  stripe:[248,248,248], win:[28,36,50]},
+  tze:    {cars:6,  carLen:20, hw:1.5, hTop:3.8, body:[230,118,42],  stripe:[250,244,232], win:[28,36,50]},
+  freight:{cars:10, carLen:13, hw:1.4, hTop:3.0, body:[104,84,66],   stripe:null,          win:null},
+};
+const AI = [];
+/* 側線停放車輛 (裝飾)：八堵貨列、板橋電聯車 */
+AI.push({kind:'freight', dir:1, s:2540, len:KINDS.freight.cars*13, v:0,
+         x:-7.8, onMain:false, fixed:true});
+AI.push({kind:'emu', dir:1, s:15630, len:KINDS.emu.cars*20, v:0,
+         x:-7.8, onMain:false, fixed:true});
+
+function trainX(t, s){          // 每節車廂在里程 s 的橫向位置
+  if(t.xPath){                  // 事件貨列：經渡線進南港側線
+    if(s < 8410) return 0;
+    if(s < 8560) return -7.8*(s-8410)/150;
+    return -7.8;
+  }
+  return t.x;
+}
+function spawnOncoming(){
+  const pick = ['emu','emu','tze','freight'][(Math.random()*4)|0];
+  const k = KINDS[pick];
+  AI.push({kind:pick, dir:-1, s:S.pos+800, len:k.cars*k.carLen,
+           v:-(19+Math.random()*11), x:-4.0, onMain:false,
+           passed:false, horned:false});
+}
+function updateAI(dt){
+  /* 對向會車班次 */
+  if(S.t >= S.nextOncoming){
+    S.nextOncoming = S.t + 40 + Math.random()*40;
+    if(!AI.some(t=>t.dir<0 && t.s>S.pos+300)) spawnOncoming();
+  }
+  /* 前行貨列事件：通過汐止後觸發，於南港側線待避 */
+  if(!S.freightSpawned && S.pos>6560 && S.pos<8100){
+    S.freightSpawned = true;
+    AI.push({kind:'freight', dir:1, s:S.pos+900, len:KINDS.freight.cars*13,
+             v:13, x:0, onMain:true, xPath:true, event:true});
+    msg('注意：前方閉塞區間有貨物列車','#fc6');
+  }
+  for(let i=AI.length-1;i>=0;i--){
+    const t = AI[i];
+    if(t.fixed) continue;
+    if(t.dir<0){
+      t.s += t.v*dt;
+      if(!t.horned && t.s>S.pos && t.s-S.pos<250){
+        t.horned=true; if(Math.random()<0.4) horn(0.05);
+      }
+      if(!t.passed && t.s < S.pos+12){ t.passed=true; whoosh(); }
+      if(t.s+t.len < S.pos-80) AI.splice(i,1);
+    }else if(t.event){
+      if(t.s<8410)      t.v = Math.min(15, t.v+0.3*dt);
+      else if(t.s<8560) t.v = Math.max(9,  t.v-0.5*dt);
+      else if(t.s<8700) t.v = Math.max(3.5,t.v-0.4*dt);
+      if(t.s>=8700){
+        t.v = 0;
+        if(t.onMain){ t.onMain=false; msg('貨物列車已進入南港側線待避','#8f8'); }
+      }
+      t.s += t.v*dt;
+    }
+  }
+}
+
+/* ---------------- 遊戲狀態 ---------------- */
+const S = {
+  mode:'title',      // title / drive / end
+  t: T('07:59:40'),  // 遊戲時鐘 (s)
+  pos: 60, v: 0,     // 位置 (m)、速度 (m/s)
+  notch: 0,          // -9=EB, -8..-1=B8..B1, 0=N, 1..4=P1..P4
+  reverser: 1,
+  doors: 'closed',   // closed / open / closing
+  doorT: 0,
+  stationIdx: 1,
+  departReady: false,
+  score: 0,
+  ebLatch: false, ebReason:'',
+  atsWarn: false, atsTimer: 0, atsBeepT: 0, atsPenalized: false,
+  msgs: [], hint: '',
+  endTimer: 0,
+  nextSigIdx: 0,                 // 下一支閉塞號誌索引
+  nextOncoming: T('08:00:20'),   // 下次對向列車生成時刻
+  freightSpawned: false,
+  testMode: false,
+  testSel: 0,                    // 測試選單游標
+  annBanner: null,               // 廣播字幕 {text, ttl}
+  annTempStop: false,            // 臨時停車廣播已播
+};
+
+function msg(text, color){
+  S.msgs.unshift({text, color:color||'#fff', ttl:4.5});
+  if(S.msgs.length>4) S.msgs.pop();
+}
+function addScore(n, text, color){
+  S.score += n;
+  if(text) msg(text + (n? `（${n>0?'+':''}${n} 分）`:''), color||(n>=0?'#9f9':'#f88'));
+}
+function triggerEB(reason){
+  if(S.ebLatch) return;
+  S.ebLatch = true; S.ebReason = reason; S.notch = -9;
+  msg('⬛ ATS 緊急煞車！' + reason, '#f55');
+  beep(300, 0.5, 0.2);
+  announce([{text:'列車緊急煞車，請各位旅客注意站穩扶好，小心煞車。', lang:'zh-TW'}], true);
+}
+
+/* ---------------- 音效 (WebAudio) ---------------- */
+/* 現代電聯車：VVVF 變頻器鳴音 + 牽引馬達低頻 + 轉動噪音 */
+let AC=null, vvfOsc, vvfGain, humOsc, humGain, noiseGain;
+function initAudio(){
+  if(AC) return;
+  try{
+    AC = new (window.AudioContext||window.webkitAudioContext)();
+    /* VVVF 變頻器鳴音 (高頻哨音) */
+    vvfOsc = AC.createOscillator(); vvfOsc.type='triangle';
+    const vf = AC.createBiquadFilter(); vf.type='lowpass'; vf.frequency.value=3400;
+    vvfGain = AC.createGain(); vvfGain.gain.value=0;
+    vvfOsc.connect(vf); vf.connect(vvfGain); vvfGain.connect(AC.destination);
+    vvfOsc.start();
+    /* 牽引馬達低頻震動 */
+    humOsc = AC.createOscillator(); humOsc.type='sine';
+    humGain = AC.createGain(); humGain.gain.value=0;
+    humOsc.connect(humGain); humGain.connect(AC.destination);
+    humOsc.start();
+    /* 轉動 / 風切噪音 */
+    const len = AC.sampleRate*1.5;
+    const buf = AC.createBuffer(1,len,AC.sampleRate);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    const src = AC.createBufferSource(); src.buffer=buf; src.loop=true;
+    const bp = AC.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=420; bp.Q.value=0.5;
+    noiseGain = AC.createGain(); noiseGain.gain.value=0;
+    src.connect(bp); bp.connect(noiseGain); noiseGain.connect(AC.destination);
+    src.start();
+  }catch(e){ AC=null; }
+}
+function updAudio(){
+  if(!AC) return;
+  const kmh = S.v*3.6, now = AC.currentTime;
+  const powering = S.notch>0 && S.doors==='closed' && !S.ebLatch;
+  const braking  = (S.notch<0 || S.ebLatch) && S.v>0.8;   // 電軔再生音
+  /* VVVF 音高曲線：起步爬升 → 低速非同步載波分段 → 高速同步連續上升 */
+  let f;
+  if(kmh < 3)       f = 260 + kmh*90;
+  else if(kmh < 50) f = 320 + ((kmh % 16)/16)*640;
+  else              f = 380 + kmh*8.5;
+  vvfOsc.frequency.setTargetAtTime(f, now, 0.03);
+  const cmd = S.ebLatch ? 1 : Math.abs(S.notch>0 ? S.notch/4 : S.notch/8);
+  const vg = (powering||braking) ? 0.016+0.014*cmd : 0;
+  vvfGain.gain.setTargetAtTime(vg, now, 0.08);
+  humOsc.frequency.setTargetAtTime(55 + kmh*5.5, now, 0.05);
+  humGain.gain.setTargetAtTime(S.v>0.3 ? 0.014 : 0, now, 0.1);
+  noiseGain.gain.setTargetAtTime(Math.min(0.13, S.v*0.005), now, 0.1);
+}
+function beep(freq, dur, vol){
+  if(!AC) return;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type='square'; o.frequency.value=freq;
+  g.gain.setValueAtTime(vol||0.08, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime+dur);
+  o.connect(g); g.connect(AC.destination);
+  o.start(); o.stop(AC.currentTime+dur);
+}
+function horn(vol){
+  if(!AC) return;
+  const v = vol || 0.09;
+  for(const fr of [311,392]){
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.type='sawtooth'; o.frequency.value=fr;
+    g.gain.setValueAtTime(0.0001, AC.currentTime);
+    g.gain.linearRampToValueAtTime(v, AC.currentTime+0.06);
+    g.gain.setValueAtTime(v, AC.currentTime+0.8);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime+1.1);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime+1.15);
+  }
+}
+function whoosh(){               // 會車呼嘯聲
+  if(!AC) return;
+  const len=AC.sampleRate*1.4, buf=AC.createBuffer(1,len,AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+  const src=AC.createBufferSource(); src.buffer=buf;
+  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=600; f.Q.value=0.5;
+  const g=AC.createGain();
+  g.gain.setValueAtTime(0.0001,AC.currentTime);
+  g.gain.linearRampToValueAtTime(0.2,AC.currentTime+0.15);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+1.3);
+  src.connect(f); f.connect(g); g.connect(AC.destination);
+  src.start(); src.stop(AC.currentTime+1.4);
+}
+function chime(){ beep(988,0.25,0.07); setTimeout(()=>beep(784,0.4,0.07),260); }
+
+/* ---------------- 車內廣播系統 ---------------- */
+/* parts: [{text, lang}]，urgent=true 時中斷目前播報立即插播 */
+function announce(parts, urgent){
+  S.annBanner = { text: parts.map(p=>p.text).join(' '), ttl: 8 };
+  chime();                                   // 廣播前奏鐘聲
+  try{
+    if(!window.speechSynthesis) return;
+    if(urgent) speechSynthesis.cancel();
+    for(const p of parts){
+      const u = new SpeechSynthesisUtterance(p.text);
+      u.lang = p.lang; u.rate = 1.0; u.volume = 0.9;
+      speechSynthesis.speak(u);
+    }
+  }catch(e){}
+}
+
+/* ---------------- 操作 ---------------- */
+window.addEventListener('keydown', e=>{
+  initAudio();
+  /* 以 e.code (實體按鍵) 為優先，避免中文輸入法攔截 e.key (變成 'Process') */
+  const CODE_MAP = {
+    KeyW:'w', KeyS:'s', KeyE:'e', KeyO:'o', KeyR:'r', KeyT:'t',
+    Space:' ', Enter:'Enter', NumpadEnter:'Enter', Escape:'Escape',
+    ArrowUp:'ArrowUp', ArrowDown:'ArrowDown',
+  };
+  let k;
+  if(e.code in CODE_MAP) k = CODE_MAP[e.code];
+  else if(/^(Digit|Numpad)[1-9]$/.test(e.code)) k = e.code.slice(-1);
+  else k = e.key;
+  if(['ArrowUp','ArrowDown',' '].includes(k)) e.preventDefault();
+
+  if(S.mode==='title'){
+    if(k==='Enter'){ S.mode='drive'; msg('請依時刻表於 08:00:00 發車','#ade'); }
+    else if(k==='t'||k==='T'){ S.mode='test'; S.testSel=0; }
+    else if(k==='1') setClass('local');
+    else if(k==='2') setClass('ck');
+    else if(k==='3') setClass('tc');
+    return;
+  }
+  if(S.mode==='test'){
+    if(k==='Escape'){ S.mode='title'; }
+    else if(k==='ArrowUp'){ S.testSel=Math.max(0,S.testSel-1); }
+    else if(k==='ArrowDown'){ S.testSel=Math.min(STOPS.length-2,S.testSel+1); }
+    else if(k==='Enter'){ startAt(S.testSel); }
+    else{
+      const n = parseInt(k,10);
+      if(n>=1 && n<=STOPS.length-1) startAt(n-1);
+    }
+    return;
+  }
+  if(S.mode==='end'){ if(k==='Enter') location.reload(); return; }
+
+  switch(k){
+    case 'ArrowUp': case 'w': case 'W':
+      if(S.ebLatch) break;
+      S.notch = S.notch===-9 ? -8 : Math.min(4, S.notch+1);
+      break;
+    case 'ArrowDown': case 's': case 'S':
+      if(S.ebLatch) break;
+      if(S.notch>-8) S.notch--;
+      break;
+    case 'e': case 'E':
+      if(S.notch!==-9){
+        S.notch=-9; msg('緊急煞車！','#f66');
+        if(S.v>2) announce([{text:'列車緊急煞車，請各位旅客注意站穩扶好，小心煞車。', lang:'zh-TW'}], true);
+      }
+      break;
+    case ' ':
+      if(!e.repeat) horn(); break;
+    case 'o': case 'O':
+      doorKey(); break;
+    case 'r': case 'R':
+      if(S.v<0.05){ S.reverser*=-1;
+        msg('換向器：'+(S.reverser>0?'前進':'後退'), S.reverser>0?'#9f9':'#fc6'); }
+      break;
+  }
+});
+
+function startAt(i){             // 測試模式：自第 i 個停靠站出發
+  const st = STOPS[i];
+  S.pos = st.pos; S.v = 0; S.notch = 0; S.reverser = 1;
+  S.doors = 'closed'; S.stationIdx = i+1; S.departReady = false;
+  S.ebLatch = false; S.atsWarn = false; S.atsTimer = 0;
+  STATIONS.forEach(s=>{ s.served=false; s.annApproach=false; });
+  STATIONS[0].served = true;
+  for(let k=1;k<=i;k++) STOPS[k].served = true;
+  S.t = (st.depT!=null ? st.depT : (st.arrT||T('08:00:00'))) - 15;
+  S.nextSigIdx = 0;
+  while(S.nextSigIdx<BLOCK_SIGS.length && BLOCK_SIGS[S.nextSigIdx]<=S.pos) S.nextSigIdx++;
+  S.nextOncoming = S.t + 10;
+  S.testMode = true; S.mode = 'drive';
+  msg(`測試模式：${CLASSES[CLS].name} 自 ${st.name} 出發（往 ${STOPS[i+1].name}）`, '#8cf');
+}
+
+function doorKey(){
+  const st = STOPS[S.stationIdx];
+  if(S.doors==='closed'){
+    if(st && !st.served && S.v<0.05 && Math.abs(S.pos-st.pos)<=8) openDoors(st);
+    else msg('此處無法開啟車門','#faa');
+  }else if(S.doors==='open'){
+    S.doors='closing'; S.doorT=2.0; beep(660,0.15,0.06);
+  }
+}
+
+function openDoors(st){
+  S.doors='open'; st.served=true;
+  st.stopErr = S.pos - st.pos;
+  st.arrErr  = st.arrT!=null ? S.t - st.arrT : 0;
+  const a = Math.abs(st.stopErr);
+  let stopPts = a<=1 ? 200 : a<=3 ? 120 : 60;
+  const e = Math.abs(st.arrErr);
+  let punPts = e<=15 ? 50 : e<=45 ? 25 : e<=90 ? 10 : 0;
+  st.pts = stopPts + punPts;
+  addScore(st.pts, `${st.name} 停車誤差 ${st.stopErr>=0?'+':''}${st.stopErr.toFixed(1)}m`,
+           a<=1?'#6f6':'#cf9');
+  if(st.arrT!=null){
+    const late = S.t - st.arrT;
+    msg(late>15 ? `誤點 ${Math.round(late)} 秒` : '準點到達！', late>15?'#fc6':'#9cf');
+  }
+  chime();
+  if(st===STOPS[STOPS.length-1]){
+    S.endTimer = 3.5;
+    msg(`終點 ${st.name}，辛苦了！`,'#ff9');
+  }
+}
+
+/* ---------------- 更新 ---------------- */
+function update(dt){
+  S.t += dt;
+
+  /* --- 動力學 --- */
+  let a = 0;
+  const eb = S.ebLatch || S.notch===-9;
+  if(S.doors!=='closed'){
+    a = -1.0;                                   // 開門時自動保持煞車
+  }else if(eb){
+    a = -1.3;
+  }else if(S.notch<0){
+    a = -(-S.notch)/8*1.05;
+  }else if(S.notch>0){
+    const kmh = S.v*3.6;
+    let ap = CLASSES[CLS].a0*(S.notch/4);
+    if(kmh>42) ap *= 42/kmh;                    // 定功率區
+    a = ap;
+  }
+  if(S.v>0) a -= 0.015 + 0.0004*S.v + 0.00011*S.v*S.v;   // 走行阻力
+  S.v += a*dt;
+  if(S.v<0) S.v=0;
+  S.pos += S.reverser * S.v * dt;
+  S.pos = Math.max(2, Math.min(TRACK_LEN-40, S.pos));
+
+  if(S.ebLatch && S.v===0){
+    S.ebLatch=false; S.notch=-8;
+    msg('緊急煞車已解除，請重新起動','#ade');
+  }
+
+  /* --- ATS 超速偵測 --- */
+  const lim = limitAt(S.pos)/3.6;
+  if(S.v > lim + 1.5/3.6 && !S.ebLatch){
+    if(!S.atsWarn){ S.atsWarn=true; S.atsPenalized=false; msg('⚠ ATS 超速警報！請立即減速','#fc4'); }
+    S.atsTimer += dt;
+    S.atsBeepT += dt;
+    if(S.atsBeepT>0.33){ S.atsBeepT=0; beep(820,0.12,0.06); }
+    if(S.v > lim + 10/3.6 || S.atsTimer > 3){
+      if(!S.atsPenalized){ S.atsPenalized=true; addScore(-100,'超速違規'); }
+      triggerEB('超速');
+    }
+  }else{ S.atsWarn=false; S.atsTimer=0; }
+
+  /* --- AI 列車 --- */
+  updateAI(dt);
+
+  /* --- 車門 --- */
+  if(S.doors==='closing'){
+    S.doorT -= dt;
+    if(S.doorT<=0){ S.doors='closed'; msg('車門已關閉','#9cf'); }
+  }
+
+  /* --- 車站流程 (僅停靠站) --- */
+  S.hint = '';
+  const st = STOPS[S.stationIdx];
+  if(st){
+    const rel = S.pos - st.pos;
+    /* 到站前雙語廣播 */
+    if(!st.served && !st.annApproach && rel>-700 && rel<-120 && S.v>5){
+      st.annApproach = true;
+      announce([
+        {text:`各位旅客，${st.name}站快到了。`, lang:'zh-TW'},
+        {text:'We are now at:', lang:'en-US'},
+        {text:st.name, lang:'zh-TW'},
+      ]);
+    }
+    if(!st.served){
+      if(rel > 40){                              // 冒進場內號誌
+        st.served=true; st.failed=true; st.pts=0;
+        addScore(-100, `未停靠 ${st.name}！冒進號誌`);
+        triggerEB('冒進號誌');
+        S.departReady = true;
+      }else if(S.v<0.05 && Math.abs(rel)<=8 && S.doors==='closed'){
+        S.hint = '已對準月台 — 按 O 開啟車門';
+      }else if(S.v<0.05 && rel<-8 && rel>-60 && S.doors==='closed'){
+        S.hint = `未達停車點，還差 ${(-rel).toFixed(1)} m，請微速前進`;
+      }else if(S.v<0.05 && rel>8 && S.doors==='closed'){
+        S.hint = `超過停車點 ${rel.toFixed(1)} m — 按 R 換後退倒車修正`;
+      }
+    }else if(S.doors==='open'){
+      if(st.depT!=null){
+        if(S.t >= st.depT-3 && !st.bellDone){ st.bellDone=true; chime(); msg('發車鈴響，請關門','#ff9'); }
+        S.hint = S.t < st.depT
+          ? `停靠中 — 發車時刻 ${fmt(st.depT)}（剩 ${Math.ceil(st.depT-S.t)} 秒）`
+          : '按 O 關閉車門';
+      }
+    }else if(S.doors==='closed' && !S.departReady && !st.failed){
+      if(st.depT==null){ /* 終點 */ }
+      else if(S.t >= st.depT){
+        S.departReady = true;
+        msg('出發號誌開通 — 請發車','#7f7');
+        beep(1046,0.2,0.06);
+      }else{
+        S.hint = `等待發車時刻 ${fmt(st.depT)}`;
+      }
+    }
+    /* 冒進出發號誌 */
+    if(st.served && !st.failed && !S.departReady && st.depT!=null && rel>40){
+      addScore(-100,'冒進出發號誌！');
+      triggerEB('冒進號誌');
+      S.departReady=true;
+    }
+    /* 進入下一站區間 */
+    if(st.served && (S.departReady||st.failed) && rel>60 && S.doors==='closed'){
+      S.stationIdx++;
+      S.departReady=false;
+    }
+  }
+
+  /* --- 閉塞號誌 --- */
+  while(S.nextSigIdx>0 && S.pos < BLOCK_SIGS[S.nextSigIdx-1]) S.nextSigIdx--;
+  while(S.nextSigIdx<BLOCK_SIGS.length && S.pos >= BLOCK_SIGS[S.nextSigIdx]){
+    const asp = blockAspect(S.nextSigIdx);
+    if(asp==='R'){ addScore(-100,'冒進閉塞號誌！'); triggerEB('冒進閉塞號誌'); }
+    else if(asp==='Y'){ msg('注意 — 前方閉塞區間有列車，請減速','#fc6'); }
+    S.nextSigIdx++;
+  }
+  if(!S.hint && S.nextSigIdx<BLOCK_SIGS.length){
+    const sp = BLOCK_SIGS[S.nextSigIdx];
+    if(sp-S.pos < 450 && blockAspect(S.nextSigIdx)==='R'){
+      S.hint = `前方 ${(sp-S.pos).toFixed(0)} m 閉塞號誌紅燈 — 請停車等候`;
+      /* 停等紅燈避讓：臨時停車廣播 */
+      if(S.v < 0.5 && !S.annTempStop){
+        S.annTempStop = true;
+        announce([{text:'本列車在此臨時停車，請各位旅客稍後，並請不要下車，以免危險。', lang:'zh-TW'}]);
+      }
+    }
+  }
+  if(S.v > 3) S.annTempStop = false;   // 再次行駛後重置，之後的臨停可再廣播
+  if(S.annBanner){ S.annBanner.ttl -= dt; if(S.annBanner.ttl<=0) S.annBanner=null; }
+
+  if(S.endTimer>0){
+    S.endTimer-=dt;
+    if(S.endTimer<=0) S.mode='end';
+  }
+
+  for(const m of S.msgs) m.ttl -= dt;
+  S.msgs = S.msgs.filter(m=>m.ttl>0);
+
+  updAudio();
+}
+
+/* ---------------- 投影與繪圖工具 ---------------- */
+let camX=0, camZ=0, camC=1, camS=0, horY=0;
+
+function setCamera(){
+  const i = Math.max(0, Math.min(TRACK_LEN, S.pos))|0;
+  const fx = S.pos - i;
+  camX = TX[i]+(TX[i+1]-TX[i])*fx;
+  camZ = TZ[i]+(TZ[i+1]-TZ[i])*fx;
+  const th = TTH[i];
+  camC = Math.cos(th); camS = Math.sin(th);
+  /* 行駛晃動：以時間為基準的低頻小振幅緩晃 (頻率與振幅不隨速度飆升，避免暈眩) */
+  const sway = Math.min(1.2, S.v*0.05);
+  const tm = performance.now();
+  horY = HOR + Math.sin(tm/900)*sway + Math.sin(tm/347)*sway*0.3;
+}
+function sliceAt(s){
+  s = Math.max(0, Math.min(TRACK_LEN, s));
+  const i = s|0, fx = s-i;
+  return { x:TX[i]+(TX[i+1]-TX[i])*fx, z:TZ[i]+(TZ[i+1]-TZ[i])*fx,
+           c:Math.cos(TTH[i]), sn:Math.sin(TTH[i]) };
+}
+function projPt(sl, w, h){
+  const wx = sl.x + w*sl.c, wz = sl.z - w*sl.sn;
+  const dx = wx-camX, dz = wz-camZ;
+  let lz = dz*camC + dx*camS;
+  if(lz < 0.35) lz = 0.35;
+  const k = FOC/lz;
+  return { x: W/2 + (dx*camC - dz*camS)*k, y: horY + (CAMH-h)*k, k };
+}
+function quad(p1,p2,p3,p4,fill){
+  ctx.fillStyle=fill; ctx.beginPath();
+  ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y);
+  ctx.lineTo(p3.x,p3.y); ctx.lineTo(p4.x,p4.y);
+  ctx.closePath(); ctx.fill();
+}
+const FOGC = [206,217,229];
+function fog(c, d){
+  const t = Math.min(0.88, Math.max(0,(d-160)/620));
+  const r=(c[0]+(FOGC[0]-c[0])*t)|0, g=(c[1]+(FOGC[1]-c[1])*t)|0, b=(c[2]+(FOGC[2]-c[2])*t)|0;
+  return `rgb(${r},${g},${b})`;
+}
+
+const SLICES = [];
+{ let d=760; while(d>1){ SLICES.push(d); d/=1.075; } }
+
+/* ---------------- 場景繪製 ---------------- */
+function drawScene(){
+  /* 天空 */
+  let g = ctx.createLinearGradient(0,0,0,horY);
+  g.addColorStop(0,'#6fa8dd'); g.addColorStop(1,'#dcedfb');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,horY);
+  ctx.fillStyle='rgba(255,250,220,0.9)';
+  ctx.beginPath(); ctx.arc(W*0.78, horY*0.32, H*0.045, 0, 7); ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,0.75)';
+  const th0 = Math.atan2(camS,camC);
+  for(const cl of [[0.15,0.35,90],[0.5,0.2,120],[0.85,0.45,70],[0.3,0.55,60]]){
+    const cx = ((cl[0]*W - th0*FOC*0.25)%(W+300)+W+300)%(W+300)-150;
+    ctx.beginPath(); ctx.ellipse(cx, horY*cl[1], cl[2]*W/1400+40, 16, 0, 0, 7); ctx.fill();
+  }
+  /* 遠山 (視差) */
+  for(const layer of [{c:'#9fb8c9',amp:1,par:1},{c:'#7fa08f',amp:1.6,par:1.5}]){
+    ctx.fillStyle=layer.c; ctx.beginPath(); ctx.moveTo(0,horY);
+    for(let px=0;px<=W;px+=16){
+      const ang = th0*layer.par + (px-W/2)/FOC;
+      const hh = (34*Math.sin(ang*3+1)+22*Math.sin(ang*7+2)+12*Math.sin(ang*13))*layer.amp;
+      ctx.lineTo(px, horY - Math.max(6, hh+30*layer.amp)*H/700);
+    }
+    ctx.lineTo(W,horY); ctx.closePath(); ctx.fill();
+  }
+  /* 地面 */
+  g = ctx.createLinearGradient(0,horY,0,H);
+  g.addColorStop(0,'#8fae72'); g.addColorStop(1,'#5d8a4c');
+  ctx.fillStyle=g; ctx.fillRect(0,horY,W,H-horY);
+
+  /* 道碴 + 鋼軌：本線(0)、對向線(-4.0)、側線 (由遠而近) */
+  const railPts = (sl,off)=>[
+    projPt(sl,off-0.80,0.12), projPt(sl,off-0.64,0.12),
+    projPt(sl,off+0.64,0.12), projPt(sl,off+0.80,0.12)];
+  let prev=null;
+  for(const d of SLICES){
+    const s = S.pos+d, sl = sliceAt(s), sx = sidingX(s);
+    const cur = {
+      d,
+      gL:projPt(sl,-6.8,0), gR:projPt(sl,3.6,0),
+      m:railPts(sl,0), o:railPts(sl,-4.0),
+      sd: sx!=null ? railPts(sl,sx) : null,
+      sgL: sx!=null ? projPt(sl,sx-1.7,0) : null,
+      sgR: sx!=null ? projPt(sl,sx+1.7,0) : null,
+    };
+    if(prev){
+      quad(prev.gL,cur.gL,cur.gR,prev.gR, fog([126,118,105], d));
+      if(prev.sd && cur.sd)
+        quad(prev.sgL,cur.sgL,cur.sgR,prev.sgR, fog([120,113,102], d));
+      for(const kk of ['m','o']){
+        quad(prev[kk][0],cur[kk][0],cur[kk][1],prev[kk][1], fog([150,155,162], d));
+        quad(prev[kk][2],cur[kk][2],cur[kk][3],prev[kk][3], fog([150,155,162], d));
+      }
+      if(prev.sd && cur.sd){
+        quad(prev.sd[0],cur.sd[0],cur.sd[1],prev.sd[1], fog([136,130,124], d));
+        quad(prev.sd[2],cur.sd[2],cur.sd[3],prev.sd[3], fog([136,130,124], d));
+      }
+    }
+    prev=cur;
+  }
+  /* 枕木 (近處，雙軌) */
+  const tie0 = Math.ceil((S.pos+1.2)/2.2)*2.2;
+  for(let s=tie0; s<S.pos+95; s+=2.2){
+    const d=s-S.pos;
+    const a=sliceAt(s), b=sliceAt(s+0.42);
+    for(const off of [0,-4.0]){
+      quad(projPt(a,off-1.25,0.06),projPt(b,off-1.25,0.06),
+           projPt(b,off+1.25,0.06),projPt(a,off+1.25,0.06), fog([74,63,52], d));
+    }
+  }
+  /* 再畫一次鋼軌覆蓋枕木 (只畫近段，雙軌) */
+  prev=null;
+  for(let i=SLICES.length-1;i>=0;i--){
+    const d=SLICES[i]; if(d>110) break;
+    const sl=sliceAt(S.pos+d);
+    const cur={ m:railPts(sl,0), o:railPts(sl,-4.0), d };
+    if(prev){
+      for(const kk of ['m','o']){
+        quad(cur[kk][0],prev[kk][0],prev[kk][1],cur[kk][1], fog([158,163,170], d));
+        quad(cur[kk][2],prev[kk][2],prev[kk][3],cur[kk][3], fog([158,163,170], d));
+      }
+    }
+    prev=cur;
+  }
+
+  /* 沿線物件 + AI 列車 (遠→近) */
+  const vis=[];
+  for(const o of OBJS){
+    const d=o.s-S.pos;
+    if(d>-15 && d<720) vis.push(o);
+  }
+  for(const t of AI){
+    const lo = t.dir>0 ? t.s-t.len : t.s;
+    const hi = t.dir>0 ? t.s : t.s+t.len;
+    if(hi > S.pos-70 && lo < S.pos+740)
+      vis.push({t:'train', s:(lo+hi)/2, tr:t});
+  }
+  vis.sort((a,b)=>b.s-a.s);
+  for(const o of vis) drawObj(o, o.s-S.pos);
+}
+
+function drawObj(o, d){
+  if(d<=0.5 && o.t!=='plat' && o.t!=='roof' && o.t!=='train') return;
+  const sl = sliceAt(o.s);
+  switch(o.t){
+    case 'train': drawTrain(o.tr); break;
+    case 'pole':{
+      /* 門型架空線架，跨越雙軌與月台 */
+      const m1b=projPt(sl,-8.4,0), m1t=projPt(sl,-8.4,5.6);
+      const m2b=projPt(sl, 9.0,0), m2t=projPt(sl, 9.0,5.6);
+      ctx.strokeStyle=fog([88,94,100],d); ctx.lineWidth=Math.max(1,0.14*m1b.k);
+      ctx.beginPath(); ctx.moveTo(m1b.x,m1b.y); ctx.lineTo(m1t.x,m1t.y);
+      ctx.moveTo(m2b.x,m2b.y); ctx.lineTo(m2t.x,m2t.y); ctx.stroke();
+      ctx.lineWidth=Math.max(1,0.1*m1b.k);
+      ctx.beginPath(); ctx.moveTo(m1t.x,m1t.y); ctx.lineTo(m2t.x,m2t.y); ctx.stroke();
+      for(const tx of [0,-4.0]){          // 吊架
+        const a=projPt(sl,tx,5.6), b2=projPt(sl,tx,5.0);
+        ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b2.x,b2.y); ctx.stroke();
+      }
+      break;
+    }
+    case 'tree':{
+      const b=projPt(sl,o.x,0), c=projPt(sl,o.x,o.h*0.62);
+      ctx.strokeStyle=fog([94,74,52],d); ctx.lineWidth=Math.max(1,0.16*b.k);
+      const tp=projPt(sl,o.x,o.h*0.4);
+      ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(tp.x,tp.y); ctx.stroke();
+      ctx.fillStyle=fog([58,112,58],d);
+      ctx.beginPath(); ctx.arc(c.x,c.y, Math.max(1,o.h*0.42*c.k), 0, 7); ctx.fill();
+      break;
+    }
+    case 'bldg':{
+      const p1=projPt(sl,o.x-o.w/2,0), p2=projPt(sl,o.x-o.w/2,o.h),
+            p3=projPt(sl,o.x+o.w/2,o.h), p4=projPt(sl,o.x+o.w/2,0);
+      quad(p1,p2,p3,p4, fog(o.c,d));
+      quad(p2,projPt(sl,o.x-o.w/2,o.h+0.5),projPt(sl,o.x+o.w/2,o.h+0.5),p3,
+           fog([o.c[0]-40,o.c[1]-40,o.c[2]-40],d));
+      if(d<220){
+        ctx.fillStyle=fog([70,86,110],d);
+        const rows=Math.min(6,Math.floor(o.h/2.6)), cols=Math.min(5,Math.floor(o.w/3));
+        for(let r=0;r<rows;r++)for(let cc=0;cc<cols;cc++){
+          const wx=o.x-o.w/2+o.w*(cc+0.5)/cols, wh=o.h*(r+0.55)/rows;
+          const p=projPt(sl,wx,wh);
+          ctx.fillRect(p.x-0.5*p.k, p.y-0.55*p.k, 1.0*p.k, 0.9*p.k);
+        }
+      }
+      break;
+    }
+    case 'bldg101':{
+      const seg=8;
+      for(let i=0;i<seg;i++){
+        const h1=o.h*i/seg, h2=o.h*(i+1)/seg, wds=o.w*(1-i*0.06);
+        quad(projPt(sl,o.x-wds/2,h1),projPt(sl,o.x-wds/2,h2),
+             projPt(sl,o.x+wds/2,h2),projPt(sl,o.x+wds/2,h1), fog([96,142,150],d));
+      }
+      const t1=projPt(sl,o.x,o.h), t2=projPt(sl,o.x,o.h+22);
+      ctx.strokeStyle=fog([96,142,150],d); ctx.lineWidth=Math.max(1,0.5*t1.k);
+      ctx.beginPath(); ctx.moveTo(t1.x,t1.y); ctx.lineTo(t2.x,t2.y); ctx.stroke();
+      break;
+    }
+    case 'plat':{
+      const a=sliceAt(o.s), b=sliceAt(o.s2);
+      quad(projPt(a,2.0,0),projPt(a,2.0,1.15),projPt(b,2.0,1.15),projPt(b,2.0,0),
+           fog([120,122,126],d));
+      quad(projPt(a,2.0,1.15),projPt(a,8.0,1.15),projPt(b,8.0,1.15),projPt(b,2.0,1.15),
+           fog([168,170,174],d));
+      quad(projPt(a,2.3,1.17),projPt(a,2.62,1.17),projPt(b,2.62,1.17),projPt(b,2.3,1.17),
+           fog([224,196,60],d));
+      break;
+    }
+    case 'roof':{
+      const a=sliceAt(o.s), b=sliceAt(Math.min(o.s+16,o.st.pos-2));
+      const c1=projPt(a,4.6,1.15), c2=projPt(a,4.6,4.55);
+      ctx.strokeStyle=fog([104,108,112],d); ctx.lineWidth=Math.max(1,0.16*c1.k);
+      ctx.beginPath(); ctx.moveTo(c1.x,c1.y); ctx.lineTo(c2.x,c2.y); ctx.stroke();
+      quad(projPt(a,2.7,4.55),projPt(a,7.4,4.55),projPt(b,7.4,4.55),projPt(b,2.7,4.55),
+           fog([88,94,100],d));
+      quad(projPt(a,2.7,4.3),projPt(a,2.7,4.55),projPt(b,2.7,4.55),projPt(b,2.7,4.3),
+           fog([132,138,146],d));
+      break;
+    }
+    case 'board':{
+      const l1=projPt(sl,3.4,1.15), l1t=projPt(sl,3.4,3.4);
+      const l2=projPt(sl,6.6,1.15), l2t=projPt(sl,6.6,3.4);
+      ctx.strokeStyle=fog([90,96,100],d); ctx.lineWidth=Math.max(1,0.1*l1.k);
+      ctx.beginPath(); ctx.moveTo(l1.x,l1.y); ctx.lineTo(l1t.x,l1t.y);
+      ctx.moveTo(l2.x,l2.y); ctx.lineTo(l2t.x,l2t.y); ctx.stroke();
+      const p1=projPt(sl,3.0,2.5), p2=projPt(sl,3.0,3.45),
+            p3=projPt(sl,7.0,3.45), p4=projPt(sl,7.0,2.5);
+      quad(p1,p2,p3,p4, fog([248,250,252],d));
+      ctx.strokeStyle=fog([30,80,160],d); ctx.lineWidth=Math.max(1,0.05*p1.k);
+      ctx.strokeRect(Math.min(p2.x,p3.x),Math.min(p2.y,p3.y),
+                     Math.abs(p3.x-p2.x),Math.abs(p1.y-p2.y));
+      if(d<260){
+        const cx=(p1.x+p3.x)/2, cy=(p1.y+p3.y)/2;
+        ctx.fillStyle=fog([20,40,90],d);
+        ctx.font = `bold ${Math.max(4,0.62*p1.k)}px "PingFang TC","Microsoft JhengHei",sans-serif`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(o.st.name, cx, cy);
+        const pv=STATIONS[o.st.idx-1], nx=STATIONS[o.st.idx+1];
+        ctx.font = `${Math.max(3,0.24*p1.k)}px sans-serif`;
+        ctx.fillText(`${pv?('← '+pv.name):''}   ${nx?(nx.name+' →'):''}`, cx, cy+0.62*p1.k);
+      }
+      break;
+    }
+    case 'stopSign':{
+      const b=projPt(sl,2.35,1.15), t=projPt(sl,2.35,2.25);
+      ctx.strokeStyle=fog([200,205,210],d); ctx.lineWidth=Math.max(1,0.08*b.k);
+      ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(t.x,t.y); ctx.stroke();
+      const p1=projPt(sl,2.0,2.25), p2=projPt(sl,2.0,3.0),
+            p3=projPt(sl,2.7,3.0), p4=projPt(sl,2.7,2.25);
+      quad(p1,p2,p3,p4, fog([250,250,250],d));
+      if(d<180){
+        ctx.fillStyle=fog([200,30,30],d);
+        ctx.font=`bold ${Math.max(4,0.5*p1.k)}px "PingFang TC",sans-serif`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText('停',(p1.x+p3.x)/2,(p1.y+p3.y)/2);
+      }
+      break;
+    }
+    case 'limitSign':{
+      const b=projPt(sl,2.6,0), t=projPt(sl,2.6,2.1);
+      ctx.strokeStyle=fog([120,124,130],d); ctx.lineWidth=Math.max(1,0.09*b.k);
+      ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(t.x,t.y); ctx.stroke();
+      const c=projPt(sl,2.6,2.5), r=Math.max(2,0.55*c.k);
+      ctx.fillStyle=fog([240,205,40],d);
+      ctx.beginPath(); ctx.arc(c.x,c.y,r,0,7); ctx.fill();
+      ctx.strokeStyle=fog([40,40,40],d); ctx.lineWidth=Math.max(1,r*0.1);
+      ctx.beginPath(); ctx.arc(c.x,c.y,r,0,7); ctx.stroke();
+      if(d<300){
+        ctx.fillStyle=fog([20,20,20],d);
+        ctx.font=`bold ${r*0.95}px sans-serif`;
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(o.v, c.x, c.y);
+      }
+      break;
+    }
+    case 'signal':{
+      const b=projPt(sl,2.6,0), t=projPt(sl,2.6,4.3);
+      ctx.strokeStyle=fog([70,74,80],d); ctx.lineWidth=Math.max(1,0.14*b.k);
+      ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(t.x,t.y); ctx.stroke();
+      const p1=projPt(sl,2.25,4.3), p2=projPt(sl,2.25,5.6),
+            p3=projPt(sl,2.95,5.6), p4=projPt(sl,2.95,4.3);
+      quad(p1,p2,p3,p4, fog([28,30,34],d));
+      const red = (STOPS[S.stationIdx]===o.st && !S.departReady);
+      const gC=projPt(sl,2.6,5.25), rC=projPt(sl,2.6,4.65);
+      const rr=Math.max(1.5,0.19*gC.k);
+      ctx.fillStyle = red ? '#333' : '#2eff5e';
+      ctx.beginPath(); ctx.arc(gC.x,gC.y,rr,0,7); ctx.fill();
+      ctx.fillStyle = red ? '#ff2e2e' : '#333';
+      ctx.beginPath(); ctx.arc(rC.x,rC.y,rr,0,7); ctx.fill();
+      break;
+    }
+    case 'blocksig':{
+      const b=projPt(sl,2.6,0), t=projPt(sl,2.6,4.2);
+      ctx.strokeStyle=fog([70,74,80],d); ctx.lineWidth=Math.max(1,0.12*b.k);
+      ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(t.x,t.y); ctx.stroke();
+      quad(projPt(sl,2.28,4.2),projPt(sl,2.28,6.0),
+           projPt(sl,2.92,6.0),projPt(sl,2.92,4.2), fog([28,30,34],d));
+      const asp = blockAspect(o.i);
+      const lamps=[['G',5.7,'#2eff5e'],['Y',5.1,'#ffcf2e'],['R',4.5,'#ff2e2e']];
+      for(const [aName,hh,col] of lamps){
+        const c=projPt(sl,2.6,hh);
+        ctx.fillStyle = asp===aName ? col : '#333';
+        ctx.beginPath(); ctx.arc(c.x,c.y,Math.max(1.4,0.18*c.k),0,7); ctx.fill();
+      }
+      break;
+    }
+  }
+}
+
+function drawTrain(t){
+  const k = KINDS[t.kind];
+  const cars=[];
+  for(let i=0;i<k.cars;i++){
+    let s1,s2;
+    if(t.dir>0){ s2=t.s-i*k.carLen; s1=s2-k.carLen+0.7; }
+    else       { s1=t.s+i*k.carLen; s2=s1+k.carLen-0.7; }
+    if(s2 < S.pos-60 || s1 > S.pos+740) continue;
+    cars.push({s1,s2,mid:(s1+s2)/2,i});
+  }
+  cars.sort((a,b)=>b.mid-a.mid);              // 遠 → 近
+  for(const c of cars){
+    const d = Math.max(2, c.mid-S.pos);
+    const xA=trainX(t,c.s1), xB=trainX(t,c.s2);
+    const slA=sliceAt(c.s1), slB=sliceAt(c.s2);
+    const hw=k.hw, hb=0.35, ht=k.hTop;
+    /* 底架 */
+    quad(projPt(slA,xA+hw,0),projPt(slA,xA+hw,hb),
+         projPt(slB,xB+hw,hb),projPt(slB,xB+hw,0), fog([30,30,34],d));
+    /* 近側車身 */
+    quad(projPt(slA,xA+hw,hb),projPt(slA,xA+hw,ht),
+         projPt(slB,xB+hw,ht),projPt(slB,xB+hw,hb), fog(k.body,d));
+    if(k.stripe)
+      quad(projPt(slA,xA+hw,1.0),projPt(slA,xA+hw,1.5),
+           projPt(slB,xB+hw,1.5),projPt(slB,xB+hw,1.0), fog(k.stripe,d));
+    if(k.win && d<380)
+      quad(projPt(slA,xA+hw,2.0),projPt(slA,xA+hw,2.8),
+           projPt(slB,xB+hw,2.8),projPt(slB,xB+hw,2.0), fog(k.win,d));
+    /* 車頂 */
+    quad(projPt(slA,xA+hw,ht),projPt(slA,xA-hw,ht),
+         projPt(slB,xB-hw,ht),projPt(slB,xB+hw,ht),
+         fog([k.body[0]*0.55|0,k.body[1]*0.55|0,k.body[2]*0.55|0],d));
+    /* 端面：面向攝影機的一端 (低里程端) */
+    const isEndCar = c.i === (t.dir>0 ? k.cars-1 : 0);
+    if(isEndCar && c.s1 > S.pos){
+      const sl=slA, x=xA;
+      quad(projPt(sl,x-hw,hb),projPt(sl,x-hw,ht),
+           projPt(sl,x+hw,ht),projPt(sl,x+hw,hb),
+           fog(t.dir<0? k.body : [k.body[0]*0.75|0,k.body[1]*0.75|0,k.body[2]*0.75|0], d));
+      if(t.dir<0){                            // 對向車頭：擋風玻璃 + 頭燈
+        quad(projPt(sl,x-hw*0.8,2.2),projPt(sl,x-hw*0.8,3.3),
+             projPt(sl,x+hw*0.8,3.3),projPt(sl,x+hw*0.8,2.2), fog([24,30,42],d));
+        ctx.fillStyle='#ffe9a8';
+        for(const lx of [x-hw*0.55, x+hw*0.55]){
+          const p=projPt(sl,lx,1.1);
+          ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(1.2,0.14*p.k),0,7); ctx.fill();
+        }
+      }else{                                  // 同向車尾：尾燈
+        ctx.fillStyle='#ff5544';
+        for(const lx of [x-hw*0.55, x+hw*0.55]){
+          const p=projPt(sl,lx,1.1);
+          ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(1,0.1*p.k),0,7); ctx.fill();
+        }
+      }
+    }
+  }
+}
+
+/* ---------------- 駕駛台 & HUD ---------------- */
+function notchLabel(){
+  if(S.ebLatch || S.notch===-9) return 'EB';
+  if(S.notch<0) return 'B'+(-S.notch);
+  if(S.notch===0) return 'N';
+  return 'P'+S.notch;
+}
+
+function drawCab(){
+  const dashTop = H*0.76;
+  /* A 柱 */
+  ctx.fillStyle='#22262b';
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W*0.055,0);
+  ctx.lineTo(W*0.015,dashTop); ctx.lineTo(0,dashTop); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(W,0); ctx.lineTo(W-W*0.055,0);
+  ctx.lineTo(W-W*0.015,dashTop); ctx.lineTo(W,dashTop); ctx.closePath(); ctx.fill();
+  ctx.fillRect(0,0,W,H*0.045);
+  /* 儀表台 */
+  const g=ctx.createLinearGradient(0,dashTop,0,H);
+  g.addColorStop(0,'#3a4046'); g.addColorStop(0.12,'#2b3036'); g.addColorStop(1,'#1a1e22');
+  ctx.fillStyle=g; ctx.fillRect(0,dashTop,W,H-dashTop);
+  ctx.fillStyle='#14171a'; ctx.fillRect(0,dashTop,W,H*0.012);
+
+  drawSpeedo(W*0.165, H*0.885, H*0.098);
+  drawNotch(W*0.80, H*0.80);
+  drawCenterPanel(dashTop);
+  drawRouteStrip(W*0.5, H*0.955);
+}
+
+function drawSpeedo(cx, cy, r){
+  ctx.fillStyle='#0c0e10';
+  ctx.beginPath(); ctx.arc(cx,cy,r*1.18,0,7); ctx.fill();
+  ctx.strokeStyle='#555'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(cx,cy,r*1.18,0,7); ctx.stroke();
+  const a0=Math.PI*0.75, a1=Math.PI*2.25;
+  const kmh=S.v*3.6, lim=limitAt(S.pos);
+  for(let v=0;v<=140;v+=10){
+    const a=a0+(a1-a0)*v/140;
+    const c1=Math.cos(a), s1=Math.sin(a);
+    ctx.strokeStyle = v<=lim ? '#ccc' : '#e05555';
+    ctx.lineWidth = v%20===0?2.4:1.2;
+    ctx.beginPath();
+    ctx.moveTo(cx+c1*r*0.86, cy+s1*r*0.86);
+    ctx.lineTo(cx+c1*r*1.0,  cy+s1*r*1.0); ctx.stroke();
+    if(v%20===0){
+      ctx.fillStyle='#bbb'; ctx.font=`${r*0.17}px sans-serif`;
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(v, cx+c1*r*0.68, cy+s1*r*0.68);
+    }
+  }
+  const la=a0+(a1-a0)*Math.min(140,lim)/140;             // 速限紅標
+  ctx.strokeStyle='#ff4444'; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.arc(cx,cy,r*1.06, la-0.03, la+0.03); ctx.stroke();
+  const na=a0+(a1-a0)*Math.min(140,kmh)/140;
+  ctx.strokeStyle='#ff8830'; ctx.lineWidth=r*0.055; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(cx,cy);
+  ctx.lineTo(cx+Math.cos(na)*r*0.82, cy+Math.sin(na)*r*0.82); ctx.stroke();
+  ctx.lineCap='butt';
+  ctx.fillStyle='#222'; ctx.beginPath(); ctx.arc(cx,cy,r*0.1,0,7); ctx.fill();
+  ctx.fillStyle = S.atsWarn ? '#ff5555' : '#7fdc7f';
+  ctx.font=`bold ${r*0.34}px "Courier New",monospace`;
+  ctx.textAlign='center';
+  ctx.fillText(kmh.toFixed(0), cx, cy+r*0.5);
+  ctx.fillStyle='#888'; ctx.font=`${r*0.15}px sans-serif`;
+  ctx.fillText('km/h', cx, cy+r*0.72);
+}
+
+function drawNotch(cx, cy){
+  const cw=Math.min(26,W*0.017), ch=H*0.05;
+  const cells=[];
+  cells.push({l:'EB', n:-9, c:'#c33'});
+  for(let i=8;i>=1;i--) cells.push({l:'B'+i, n:-i, c:'#c80'});
+  cells.push({l:'N', n:0, c:'#888'});
+  for(let i=1;i<=4;i++) cells.push({l:'P'+i, n:i, c:'#2a2'});
+  const total=cells.length*cw;
+  const cur = S.ebLatch ? -9 : S.notch;
+  ctx.font=`${cw*0.5}px sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+  cells.forEach((c,i)=>{
+    const x=cx-total/2+i*cw;
+    const active = c.n===cur;
+    ctx.fillStyle = active ? c.c : '#22262a';
+    ctx.fillRect(x, cy, cw-2, ch);
+    ctx.strokeStyle='#000'; ctx.strokeRect(x, cy, cw-2, ch);
+    ctx.fillStyle = active ? '#fff' : '#666';
+    ctx.fillText(c.l, x+cw/2-1, cy+ch/2);
+  });
+  ctx.fillStyle = S.notch>0?'#7f7':(S.notch<0||S.ebLatch)?'#fa5':'#ccc';
+  ctx.font=`bold ${UF*0.045}px "Courier New",monospace`;
+  ctx.fillText(notchLabel(), cx, cy-H*0.035);
+}
+
+function lamp(x,y,r,on,color,label){
+  ctx.fillStyle = on?color:'#26292d';
+  ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.stroke();
+  ctx.fillStyle='#aaa'; ctx.font=`${r*1.05}px sans-serif`;
+  ctx.textAlign='center'; ctx.fillText(label, x, y+r*2.3);
+}
+
+function drawCenterPanel(dashTop){
+  const cx=W*0.5, y=dashTop+H*0.055;
+  ctx.fillStyle='#dfe8ee';
+  ctx.font=`bold ${UF*0.038}px "Courier New",monospace`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(fmt(S.t), cx, y);
+  const r=H*0.012;
+  lamp(cx-W*0.09, y+H*0.05, r, S.doors==='closed', '#2eff5e', '戶閉');
+  lamp(cx-W*0.045, y+H*0.05, r, S.atsWarn||S.ebLatch, '#ff3030', 'ATS');
+  lamp(cx, y+H*0.05, r, S.notch>0&&S.doors==='closed'&&!S.ebLatch, '#ffd24a', '力行');
+  lamp(cx+W*0.045, y+H*0.05, r, S.reverser<0, '#ff8830', '後退');
+  lamp(cx+W*0.09, y+H*0.05, r, S.departReady, '#2eff5e', '出發');
+}
+
+function drawRouteStrip(cx, y){
+  const w=W*0.34, x0=cx-w/2;
+  const p0=STOPS[0].pos, p1=STOPS[STOPS.length-1].pos;
+  ctx.strokeStyle='#556'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(x0+w,y); ctx.stroke();
+  STOPS.forEach((st,i)=>{
+    const x=x0+w*(st.pos-p0)/(p1-p0);
+    ctx.fillStyle = st.failed ? '#e33' : st.served ? '#2eff5e' : '#99a';
+    ctx.beginPath(); ctx.arc(x,y,4,0,7); ctx.fill();
+    if(i===S.stationIdx){
+      ctx.fillStyle='#ffd24a'; ctx.font=`${H*0.016}px sans-serif`;
+      ctx.textAlign='center'; ctx.fillText(st.name, x, y-11);
+    }
+  });
+  const tx=x0+w*Math.min(1,Math.max(0,(S.pos-p0)/(p1-p0)));
+  ctx.fillStyle='#ff8830';
+  ctx.beginPath(); ctx.moveTo(tx,y-7); ctx.lineTo(tx-5,y-14); ctx.lineTo(tx+5,y-14);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawHUD(){
+  /* 左上資訊板 */
+  const st=STOPS[S.stationIdx];
+  ctx.fillStyle='rgba(10,14,20,0.62)';
+  ctx.beginPath(); ctx.roundRect(W*0.02, H*0.06, W*0.24, H*0.19, 8); ctx.fill();
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  const lx=W*0.035; let ly=H*0.095; const lh=H*0.036;
+  ctx.font=`${UF*0.024}px sans-serif`;
+  if(st){
+    const dist=st.pos-S.pos;
+    ctx.fillStyle='#ffd24a';
+    ctx.fillText(`下一站：${st.name}${st===STOPS[STOPS.length-1]?'（終點）':''}`, lx, ly); ly+=lh;
+    ctx.fillStyle='#cde';
+    ctx.fillText(`到站時刻 ${st.arrT!=null?fmt(st.arrT):'--'}`, lx, ly); ly+=lh;
+    ctx.fillText(`距停車點 ${dist>0?dist.toFixed(0)+' m':(Math.abs(dist)<9?'── 對準 ──':'已超過')}`, lx, ly); ly+=lh;
+  }
+  const nl=nextLimitChange(S.pos);
+  ctx.fillStyle = nl && nl.from-S.pos<700 ? '#fc6' : '#9ab';
+  ctx.fillText(nl && nl.from-S.pos<700
+    ? `▼ 前方 ${(nl.from-S.pos).toFixed(0)} m 限速 ${nl.limit}`
+    : `本區間速限 ${limitAt(S.pos)} km/h`, lx, ly);
+
+  /* 右上：得分 + 速限牌 */
+  ctx.fillStyle='rgba(10,14,20,0.62)';
+  ctx.beginPath(); ctx.roundRect(W*0.80, H*0.06, W*0.18, H*0.115, 8); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font=`bold ${UF*0.03}px sans-serif`;
+  ctx.fillText(`得分 ${S.score}`, W*0.815, H*0.095);
+  ctx.fillStyle='#ffd24a'; ctx.font=`${UF*0.024}px sans-serif`;
+  ctx.fillText(`速限 ${limitAt(S.pos)} km/h`, W*0.815, H*0.14);
+
+  /* 廣播字幕條 */
+  if(S.annBanner){
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.font=`${UF*0.021}px sans-serif`;
+    const txt='🔊 車內廣播：'+S.annBanner.text;
+    const tw=ctx.measureText(txt).width;
+    ctx.globalAlpha=Math.min(1, S.annBanner.ttl/0.8);
+    ctx.fillStyle='rgba(6,32,44,0.75)';
+    ctx.fillRect(W/2-tw/2-16, H*0.155-UF*0.019, tw+32, UF*0.038);
+    ctx.fillStyle='#9fe8ff';
+    ctx.fillText(txt, W/2, H*0.155);
+    ctx.globalAlpha=1;
+  }
+
+  /* 訊息 */
+  ctx.textAlign='center';
+  S.msgs.forEach((m,i)=>{
+    ctx.globalAlpha=Math.min(1,m.ttl/0.8);
+    ctx.font=`bold ${UF*0.028}px sans-serif`;
+    ctx.fillStyle='rgba(0,0,0,0.55)';
+    const tw=ctx.measureText(m.text).width;
+    ctx.fillRect(W/2-tw/2-14, H*0.27+i*H*0.05-H*0.02, tw+28, H*0.04);
+    ctx.fillStyle=m.color;
+    ctx.fillText(m.text, W/2, H*0.27+i*H*0.05);
+    ctx.globalAlpha=1;
+  });
+
+  /* 提示 */
+  if(S.hint){
+    ctx.font=`${UF*0.024}px sans-serif`;
+    const pulse=0.75+0.25*Math.sin(performance.now()/300);
+    ctx.fillStyle=`rgba(255,235,150,${pulse})`;
+    ctx.fillText(S.hint, W/2, H*0.62);
+  }
+  /* 按鍵備忘 */
+  ctx.textAlign='left'; ctx.fillStyle='#5a646e'; ctx.font=`${H*0.015}px sans-serif`;
+  ctx.fillText('↑加速  ↓煞車  E緊急  O車門  R換向  空白鍵鳴笛', W*0.02, H*0.985);
+  /* 測試模式徽章 */
+  if(S.testMode){
+    ctx.textAlign='center'; ctx.fillStyle='#8cf';
+    ctx.font=`bold ${UF*0.02}px sans-serif`;
+    ctx.fillText('【測試模式】', W/2, H*0.075);
+  }
+}
+
+/* ---------------- 標題 / 結算畫面 ---------------- */
+function drawTitle(){
+  ctx.fillStyle='rgba(8,12,20,0.78)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  const c = CLASSES[CLS];
+  ctx.fillStyle='#ffd24a';
+  ctx.font=`bold ${UF*0.058}px "PingFang TC","Microsoft JhengHei",sans-serif`;
+  ctx.fillText('臺鐵縱貫線 列車模擬駕駛', W/2, H*0.13);
+  ctx.fillStyle='#cde'; ctx.font=`${UF*0.027}px sans-serif`;
+  ctx.fillText(`${c.name} ${c.trainNo}　${STOPS[0].name} → ${STOPS[STOPS.length-1].name}（${c.model}）`, W/2, H*0.20);
+  ctx.fillStyle='#9ab'; ctx.font=`${UF*0.018}px sans-serif`;
+  ctx.fillText('停靠：'+STOPS.map(s=>s.name).join('－'), W/2, H*0.25);
+
+  /* 車種選擇 */
+  ctx.fillStyle='#ffd24a'; ctx.font=`bold ${UF*0.024}px sans-serif`;
+  ctx.fillText('選擇車種（按 1 / 2 / 3）', W/2, H*0.31);
+  const clsRows=[
+    ['1','local','區間車　基隆 → 樹林　各站皆停'],
+    ['2','ck',   '莒光號　基隆 → 樹林　僅停大站'],
+    ['3','tc',   '自強號　基隆 → 台北　僅停 基隆・松山・台北'],
+  ];
+  ctx.font=`${UF*0.023}px sans-serif`;
+  clsRows.forEach((r,i)=>{
+    const y=H*0.355+i*H*0.042;
+    const sel = CLS===r[1];
+    ctx.fillStyle = sel?'#ffd24a':'#8a94a0';
+    ctx.fillText((sel?'▶ ':'　 ')+r[0]+'　'+r[2], W/2, y);
+  });
+
+  const lines=[
+    ['↑ / W','推進段位 +1（P1〜P4）'],
+    ['↓ / S','煞車段位 +1（B1〜B8）'],
+    ['E','緊急煞車（EB）'],
+    ['O','開／關車門（停準月台後）'],
+    ['R','換向器（停車時可倒車修正）'],
+    ['空白鍵','鳴笛'],
+  ];
+  ctx.font=`${UF*0.022}px sans-serif`;
+  lines.forEach((l,i)=>{
+    const y=H*0.50+i*H*0.038;
+    ctx.fillStyle='#ffd24a'; ctx.textAlign='right'; ctx.fillText(l[0], W/2-W*0.02, y);
+    ctx.fillStyle='#dfe8ee'; ctx.textAlign='left'; ctx.fillText(l[1], W/2+W*0.02, y);
+  });
+  ctx.textAlign='center'; ctx.fillStyle='#9ab'; ctx.font=`${UF*0.019}px sans-serif`;
+  ctx.fillText('停車誤差 ±8m 內才能開門；請遵守速限、閉塞號誌與出發號誌，準點行駛。', W/2, H*0.72);
+  ctx.fillStyle='#8cf'; ctx.font=`${UF*0.021}px sans-serif`;
+  ctx.fillText('按 T 進入測試模式（選擇特定區間測試）', W/2, H*0.765);
+  const pulse=0.6+0.4*Math.sin(performance.now()/350);
+  ctx.fillStyle=`rgba(255,255,255,${pulse})`;
+  ctx.font=`bold ${UF*0.032}px sans-serif`;
+  ctx.fillText('― 按 Enter 出勤 ―', W/2, H*0.82);
+}
+
+function drawTest(){
+  ctx.fillStyle='rgba(8,12,20,0.85)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#8cf'; ctx.font=`bold ${UF*0.048}px sans-serif`;
+  ctx.fillText(`測試模式 — ${CLASSES[CLS].name} 選擇出發區間`, W/2, H*0.1);
+  const n = STOPS.length-1;
+  const rh = Math.min(H*0.058, H*0.56/n);
+  ctx.font=`${Math.min(UF*0.026, rh*0.62)}px sans-serif`;
+  for(let i=0;i<n;i++){
+    const y=H*0.18+i*rh;
+    const sel = i===S.testSel;
+    if(sel){
+      ctx.fillStyle='rgba(136,204,255,0.14)';
+      ctx.fillRect(W/2-W*0.24, y-rh*0.42, W*0.48, rh*0.84);
+    }
+    ctx.fillStyle = sel?'#ffd24a':'#c8b070'; ctx.textAlign='right';
+    ctx.fillText((i<9?String(i+1):'·'), W/2-W*0.14, y);
+    ctx.fillStyle = sel?'#fff':'#aab4c0'; ctx.textAlign='left';
+    ctx.fillText(`${STOPS[i].name} → ${STOPS[i+1].name}`
+      + (STOPS[i].pos<=6560 && STOPS[i+1].pos>6560 ? '　（含貨物列車避讓事件）':''),
+      W/2-W*0.11, y);
+  }
+  ctx.textAlign='center'; ctx.fillStyle='#9ab'; ctx.font=`${UF*0.021}px sans-serif`;
+  ctx.fillText('↑↓ 選擇＋Enter 或按數字鍵直接出發；Esc 返回標題（車種請先在標題畫面選定）', W/2, H*0.82);
+}
+
+function drawEnd(){
+  ctx.fillStyle='rgba(8,12,20,0.85)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#ffd24a'; ctx.font=`bold ${UF*0.05}px sans-serif`;
+  ctx.fillText('行車結束 — 成績單', W/2, H*0.1);
+
+  const rows=STOPS.slice(1);
+  const rh=Math.min(H*0.052, H*0.46/rows.length);
+  ctx.font=`${Math.min(UF*0.023, rh*0.6)}px sans-serif`;
+  const colX=[W*0.28,W*0.44,W*0.60,W*0.76];
+  ctx.fillStyle='#9ab';
+  ['車站','停車誤差','誤點','得分'].forEach((h,i)=>ctx.fillText(h,colX[i],H*0.17));
+  rows.forEach((st,i)=>{
+    const y=H*0.21+i*rh;
+    ctx.fillStyle='#dfe8ee'; ctx.fillText(st.name, colX[0], y);
+    if(st.failed){
+      ctx.fillStyle='#f66'; ctx.fillText('未停靠', colX[1], y);
+      ctx.fillText('—', colX[2], y);
+    }else if(st.stopErr!=null){
+      ctx.fillStyle=Math.abs(st.stopErr)<=1?'#6f6':'#dfe8ee';
+      ctx.fillText(`${st.stopErr>=0?'+':''}${st.stopErr.toFixed(1)} m`, colX[1], y);
+      const late=Math.round(st.arrErr);
+      ctx.fillStyle=late>15?'#fc6':'#6f6';
+      ctx.fillText(late>0?`+${late}s`:`${late}s`, colX[2], y);
+    }else{
+      ctx.fillStyle='#888'; ctx.fillText('—', colX[1], y); ctx.fillText('—', colX[2], y);
+    }
+    ctx.fillStyle='#ffd24a';
+    ctx.fillText(st.pts!=null?st.pts:'—', colX[3], y);
+  });
+
+  const ratio = S.score / ((STOPS.length-1)*250);   // 每站滿分 250
+  const rank = ratio>=0.9?'S':ratio>=0.7?'A':ratio>=0.5?'B':ratio>=0.3?'C':'D';
+  ctx.fillStyle='#fff'; ctx.font=`bold ${UF*0.04}px sans-serif`;
+  ctx.fillText(`總分 ${S.score}`, W/2, H*0.70);
+  ctx.fillStyle=rank==='S'?'#ffd24a':rank==='A'?'#8f8':'#cde';
+  ctx.font=`bold ${UF*0.075}px sans-serif`;
+  ctx.fillText(`評定：${rank} 級`, W/2, H*0.78);
+  const pulse=0.6+0.4*Math.sin(performance.now()/350);
+  ctx.fillStyle=`rgba(255,255,255,${pulse})`;
+  ctx.font=`${UF*0.026}px sans-serif`;
+  ctx.fillText('按 Enter 再次出勤', W/2, H*0.88);
+}
+
+/* ---------------- 主迴圈 ---------------- */
+function render(){
+  setCamera();
+  drawScene();
+  drawCab();
+  if(S.mode==='drive') drawHUD();
+  if(S.mode==='title') drawTitle();
+  if(S.mode==='test') drawTest();
+  if(S.mode==='end') drawEnd();
+}
+
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000);
+  last=now;
+  if(S.mode==='drive') update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__S = S;   // debug
+window.__dbg = ()=>({CLS, stops:STOPS.map(s=>({n:s.name,pos:s.pos,
+  arr:s.arrT!=null?fmt(s.arrT):null, dep:s.depT!=null?fmt(s.depT):null}))});
+</script>
+</body>
+</html>
