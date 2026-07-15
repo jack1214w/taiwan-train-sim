@@ -779,7 +779,7 @@ function updateEvents(dt){
         e.phase='aftermath'; e.timer=25; e.fled=true;
         S.flash=0.6;
         thud();
-        addScore(-300,'撞擊入侵人員！重大行車事故');
+        msg('發生行車事故！需停車處理 25 秒','#f66');   // 不扣分，以時間為代價
         triggerEB('人員入侵事故');
         announce([{text:'本列車發生緊急事故，已緊急停車，請各位旅客留在原位，稍安勿躁。', lang:'zh-TW'}], true);
       }
