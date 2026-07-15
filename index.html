@@ -201,6 +201,8 @@ function effLimitVal(raw){
     const e = S.evt;
     l = Math.min(l, Math.max(40, (e.startV||40) - 3*(e.elapsed||0)));
   }
+  /* 行控中心核准提速 (站區低速段不適用) */
+  if(S.ctcBoost>0 && raw>=60) l = Math.min(150, l + S.ctcBoost);
   return l;
 }
 function effLimitAt(s){ return effLimitVal(limitAt(s)); }
@@ -403,6 +405,12 @@ const S = {
   escT: 0,                       // Esc 再按一次確認倒數
   evt: null,                     // 進行中的突發事件
   nextEvtT: T('08:02:30'),       // 下次突發事件時刻
+  paused: false,                 // 暫停
+  ctcPending: 0,                 // 行控中心回覆倒數
+  ctcCool: 0,                    // 呼叫冷卻
+  ctcBoost: 0, ctcBoostT: 0,     // 行控核准提速量 / 剩餘秒數
+  atpOff: 0,                     // ATP 關閉剩餘秒數
+  ctcMsg: null,                  // 行控中心訊息 {text, ttl}
 };
 
 function msg(text, color){
@@ -530,6 +538,7 @@ window.addEventListener('keydown', e=>{
   /* 以 e.code (實體按鍵) 為優先，避免中文輸入法攔截 e.key (變成 'Process') */
   const CODE_MAP = {
     KeyW:'w', KeyS:'s', KeyE:'e', KeyO:'o', KeyR:'r', KeyT:'t',
+    KeyP:'p', KeyC:'c',
     Space:' ', Enter:'Enter', NumpadEnter:'Enter', Escape:'Escape',
     ArrowUp:'ArrowUp', ArrowDown:'ArrowDown',
   };
@@ -561,7 +570,23 @@ window.addEventListener('keydown', e=>{
   }
   if(S.mode==='end'){ if(k==='Enter'||k==='Escape') resetGame(); return; }
 
+  /* 暫停中僅接受 P 與 Esc */
+  if(S.paused && k!=='p' && k!=='Escape') return;
+
   switch(k){
+    case 'p':
+      S.paused = !S.paused;
+      if(S.paused){
+        if(AC) for(const g of [vvfGain,humGain,noiseGain])
+          g.gain.setTargetAtTime(0, AC.currentTime, 0.05);
+        try{ if(window.speechSynthesis) speechSynthesis.pause(); }catch(e){}
+      }else{
+        try{ if(window.speechSynthesis) speechSynthesis.resume(); }catch(e){}
+      }
+      break;
+    case 'c':
+      ctcCall();
+      break;
     case 'ArrowUp': case 'w': case 'W':
       if(S.ebLatch) break;
       S.notch = S.notch===-9 ? -8 : Math.min(4, S.notch+1);
@@ -605,6 +630,45 @@ function resetGame(){            // 返回標題畫面 (保留車種選擇)
   S.freightSpawned=false; S.testMode=false; S.testSel=0;
   S.annBanner=null; S.annTempStop=false; S.escT=0;
   S.evt=null; S.nextEvtT=T('08:02:30');
+  S.paused=false; S.ctcPending=0; S.ctcCool=0;
+  S.ctcBoost=0; S.ctcBoostT=0; S.atpOff=0; S.ctcMsg=null;
+}
+
+/* ---------------- 行控中心 (CTC) ---------------- */
+function computeDelay(){          // 依時刻表內插估算目前誤點秒數
+  const st = STOPS[S.stationIdx];
+  if(!st || st.arrT==null) return 0;
+  const p = STOPS[S.stationIdx-1];
+  if(!p || p.depT==null) return 0;
+  const f = Math.max(0, Math.min(1, (S.pos-p.pos)/(st.pos-p.pos)));
+  return S.t - (p.depT + (st.arrT-p.depT)*f);
+}
+function ctcDecide(){             // 行控中心裁決演算法
+  const delay = computeDelay();
+  if(S.atpOff>0 || S.ctcBoost>0)
+    return {text:'先前核准仍然有效，請依核准條件行駛。'};
+  if(S.evt){
+    if(S.evt.type==='quake')
+      return {text:'地震警戒中，不同意提速，請依規定減速慢行。'};
+    return {text:'突發事件處理中，不同意提速，請依現場指示操作。'};
+  }
+  if(STOPS[STOPS.length-1].pos - S.pos < 2500)
+    return {text:'貴列車即將到達終點站，不同意提速，請依號誌進站。'};
+  if(delay < 45)
+    return {text:`貴列車目前${delay<15?'準點運行':'誤點約 '+Math.round(delay)+' 秒'}，未達提速標準，不同意提速。`};
+  if(delay >= 300)
+    return {text:`貴列車嚴重誤點約 ${Math.round(delay/60)} 分鐘，同意關閉 ATP 三分鐘！超速將不受防護，請以目視行車並自行確保安全。`,
+            atp:180};
+  const boost = Math.min(50, Math.ceil(delay/60)*10);
+  return {text:`貴列車誤點約 ${Math.round(delay)} 秒，同意提速：全線速限 +${boost} km/h，有效 4 分鐘，請注意行車安全。`,
+          boost, boostT:240};
+}
+function ctcCall(){               // 按 C 呼叫
+  if(S.ctcPending>0){ msg('與行控中心通話中…','#8ff'); return; }
+  if(S.ctcCool>0){ msg(`行控中心忙線，請 ${Math.ceil(S.ctcCool)} 秒後再呼叫`,'#fc6'); return; }
+  S.ctcPending = 2.5;
+  msg('📻 呼叫行控中心：本務列車請求提高速限…','#8ff');
+  beep(1180,0.09,0.06);
 }
 
 /* ---------------- 突發事件系統 ---------------- */
@@ -777,9 +841,34 @@ function update(dt){
     msg('緊急煞車已解除，請重新起動','#ade');
   }
 
-  /* --- ATS 超速偵測 (依車種有效速限，地震時 40) --- */
+  /* --- 行控中心 --- */
+  if(S.ctcPending>0){
+    S.ctcPending -= dt;
+    if(S.ctcPending<=0){
+      const d = ctcDecide();
+      if(d.atp) S.atpOff = d.atp;
+      if(d.boost){ S.ctcBoost = d.boost; S.ctcBoostT = d.boostT; }
+      S.ctcMsg = {text:d.text, ttl:9};
+      beep(1180,0.09,0.06); setTimeout(()=>beep(920,0.12,0.06),160);
+      S.ctcCool = 15;
+    }
+  }
+  if(S.ctcCool>0) S.ctcCool -= dt;
+  if(S.ctcBoostT>0){
+    S.ctcBoostT -= dt;
+    if(S.ctcBoostT<=0){ S.ctcBoost=0; msg('行控核准提速時效結束，恢復原速限','#fc6'); }
+  }
+  if(S.atpOff>0){
+    S.atpOff -= dt;
+    if(S.atpOff<=0){ msg('ATP 已恢復作用','#8f8'); beep(1046,0.2,0.06); }
+  }
+  if(S.ctcMsg){ S.ctcMsg.ttl -= dt; if(S.ctcMsg.ttl<=0) S.ctcMsg=null; }
+
+  /* --- ATS 超速偵測 (依車種有效速限，地震時 40；ATP 關閉時停用) --- */
   const lim = effLimitAt(S.pos)/3.6;
-  if(S.v > lim + 1.5/3.6 && !S.ebLatch){
+  if(S.atpOff>0){
+    S.atsWarn=false; S.atsTimer=0;
+  }else if(S.v > lim + 1.5/3.6 && !S.ebLatch){
     if(!S.atsWarn){ S.atsWarn=true; S.atsPenalized=false; msg('⚠ ATS 超速警報！請立即減速','#fc4'); }
     S.atsTimer += dt;
     S.atsBeepT += dt;
@@ -1439,7 +1528,11 @@ function drawHUD(){
   ctx.fillStyle = nl && nl.from-S.pos<700 ? '#fc6' : '#9ab';
   ctx.fillText(nl && nl.from-S.pos<700
     ? `▼ 前方 ${(nl.from-S.pos).toFixed(0)} m 限速 ${effLimitVal(nl.limit)}`
-    : `本區間速限 ${effLimitAt(S.pos)} km/h`, lx, ly);
+    : `本區間速限 ${effLimitAt(S.pos)} km/h`, lx, ly); ly+=lh;
+  if(S.ctcBoost>0){
+    ctx.fillStyle='#8ff';
+    ctx.fillText(`行控核准 +${S.ctcBoost}（剩 ${Math.ceil(S.ctcBoostT)}s）`, lx, ly);
+  }
 
   /* 右上：得分 + 速限牌 */
   ctx.fillStyle='rgba(10,14,20,0.62)';
@@ -1468,9 +1561,35 @@ function drawHUD(){
     const flash = e.type!=='quake'&&e.phase!=='clearing'&&e.phase!=='handling'
                   && Math.floor(performance.now()/400)%2===0;
     ctx.fillStyle = flash ? 'rgba(120,20,10,0.85)' : 'rgba(60,30,8,0.8)';
-    ctx.fillRect(W/2-tw/2-16, H*0.205-UF*0.02, tw+32, UF*0.04);
+    ctx.fillRect(W/2-tw/2-16, H*0.245-UF*0.02, tw+32, UF*0.04);
     ctx.fillStyle='#ffb36a';
-    ctx.fillText(txt, W/2, H*0.205);
+    ctx.fillText(txt, W/2, H*0.245);
+  }
+
+  /* 行控中心訊息框 */
+  if(S.ctcMsg){
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.font=`${UF*0.021}px sans-serif`;
+    const txt='📻 行控中心：'+S.ctcMsg.text;
+    const tw=ctx.measureText(txt).width;
+    ctx.globalAlpha=Math.min(1, S.ctcMsg.ttl/0.8);
+    ctx.fillStyle='rgba(6,44,30,0.8)';
+    ctx.fillRect(W/2-tw/2-16, H*0.195-UF*0.019, tw+32, UF*0.038);
+    ctx.fillStyle='#8fe8b0';
+    ctx.fillText(txt, W/2, H*0.195);
+    ctx.globalAlpha=1;
+  }
+  /* ATP 關閉警示 */
+  if(S.atpOff>0){
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.font=`bold ${UF*0.022}px sans-serif`;
+    const txt=`⚠ ATP 已關閉（剩 ${Math.ceil(S.atpOff)} 秒）— 超速不受防護，請自行注意安全`;
+    const tw=ctx.measureText(txt).width;
+    ctx.fillStyle = Math.floor(performance.now()/500)%2===0
+      ? 'rgba(110,60,5,0.85)' : 'rgba(70,40,5,0.8)';
+    ctx.fillRect(W/2-tw/2-16, H*0.285-UF*0.019, tw+32, UF*0.038);
+    ctx.fillStyle='#ffcf5e';
+    ctx.fillText(txt, W/2, H*0.285);
   }
 
   /* 廣播字幕條 */
@@ -1509,7 +1628,7 @@ function drawHUD(){
   }
   /* 按鍵備忘 */
   ctx.textAlign='left'; ctx.fillStyle='#5a646e'; ctx.font=`${H*0.015}px sans-serif`;
-  ctx.fillText('↑加速  ↓煞車  E緊急  O車門  R換向  空白鍵鳴笛  Esc×2返回標題', W*0.02, H*0.985);
+  ctx.fillText('↑加速  ↓煞車  E緊急  O車門  R換向  P暫停  C行控中心  空白鍵鳴笛  Esc×2返回標題', W*0.02, H*0.985);
   /* 測試模式徽章 */
   if(S.testMode){
     ctx.textAlign='center'; ctx.fillStyle='#8cf';
@@ -1554,11 +1673,13 @@ function drawTitle(){
     ['E','緊急煞車（EB）'],
     ['O','開／關車門（停準月台後）'],
     ['R','換向器（停車時可倒車修正）'],
+    ['P','暫停'],
+    ['C','呼叫行控中心（誤點時請求提速）'],
     ['空白鍵','鳴笛'],
   ];
-  ctx.font=`${UF*0.021}px sans-serif`;
+  ctx.font=`${UF*0.02}px sans-serif`;
   lines.forEach((l,i)=>{
-    const y=H*0.515+i*H*0.033;
+    const y=H*0.505+i*H*0.029;
     ctx.fillStyle='#ffd24a'; ctx.textAlign='right'; ctx.fillText(l[0], W/2-W*0.02, y);
     ctx.fillStyle='#dfe8ee'; ctx.textAlign='left'; ctx.fillText(l[1], W/2+W*0.02, y);
   });
@@ -1643,11 +1764,23 @@ function drawEnd(){
 }
 
 /* ---------------- 主迴圈 ---------------- */
+function drawPause(){
+  ctx.fillStyle='rgba(8,12,20,0.6)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='#fff'; ctx.font=`bold ${UF*0.06}px sans-serif`;
+  ctx.fillText('⏸ 暫停中', W/2, H*0.42);
+  const pulse=0.55+0.45*Math.sin(performance.now()/350);
+  ctx.fillStyle=`rgba(220,232,240,${pulse})`;
+  ctx.font=`${UF*0.026}px sans-serif`;
+  ctx.fillText('按 P 繼續行駛', W/2, H*0.52);
+}
+
 function render(){
   setCamera();
   drawScene();
   drawCab();
   if(S.mode==='drive') drawHUD();
+  if(S.mode==='drive' && S.paused) drawPause();
   if(S.mode==='title') drawTitle();
   if(S.mode==='test') drawTest();
   if(S.mode==='end') drawEnd();
@@ -1657,7 +1790,7 @@ let last=performance.now();
 function frame(now){
   const dt=Math.min(0.05,(now-last)/1000);
   last=now;
-  if(S.mode==='drive') update(dt);
+  if(S.mode==='drive' && !S.paused) update(dt);
   render();
   requestAnimationFrame(frame);
 }
