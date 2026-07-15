@@ -928,12 +928,17 @@ function update(dt){
     S.atsWarn=false; S.atsTimer=0;
   }else if(S.v > lim + 1.5/3.6 && !S.ebLatch){
     if(!S.atsWarn){ S.atsWarn=true; S.atsPenalized=false; msg('⚠ ATS 超速警報！請立即減速','#fc4'); }
-    S.atsTimer += dt;
     S.atsBeepT += dt;
     if(S.atsBeepT>0.33){ S.atsBeepT=0; beep(820,0.12,0.06); }
-    if(S.v > lim + 10/3.6 || S.atsTimer > 3){
-      if(!S.atsPenalized){ S.atsPenalized=true; addScore(-100,'超速違規'); }
-      triggerEB('超速');
+    if(S.notch <= -6){
+      /* 已使用 B6 以上重煞 (含 EB)：視為駕駛積極減速，僅警告、不觸發 ATP */
+      S.atsTimer = 0;
+    }else{
+      S.atsTimer += dt;
+      if(S.v > lim + 10/3.6 || S.atsTimer > 3){
+        if(!S.atsPenalized){ S.atsPenalized=true; addScore(-100,'超速違規'); }
+        triggerEB('超速');
+      }
     }
   }else{ S.atsWarn=false; S.atsTimer=0; }
 
@@ -1406,19 +1411,21 @@ function drawObj(o, d){
 
 function drawTrain(t){
   const k = KINDS[t.kind];
+  const NEAR = S.pos + 2.0;                   // 近平面：相機後方/貼身車廂不繪製，避免破圖
   const cars=[];
   for(let i=0;i<k.cars;i++){
     let s1,s2;
     if(t.dir>0){ s2=t.s-i*k.carLen; s1=s2-k.carLen+0.7; }
     else       { s1=t.s+i*k.carLen; s2=s1+k.carLen-0.7; }
-    if(s2 < S.pos-60 || s1 > S.pos+740) continue;
+    if(s2 <= NEAR || s1 > S.pos+740) continue;
     cars.push({s1,s2,mid:(s1+s2)/2,i});
   }
   cars.sort((a,b)=>b.mid-a.mid);              // 遠 → 近
   for(const c of cars){
     const d = Math.max(2, c.mid-S.pos);
-    const xA=trainX(t,c.s1), xB=trainX(t,c.s2);
-    const slA=sliceAt(c.s1), slB=sliceAt(c.s2);
+    const s1c = Math.max(c.s1, NEAR);         // 跨越近平面的車廂只畫前方部分
+    const xA=trainX(t,s1c), xB=trainX(t,c.s2);
+    const slA=sliceAt(s1c), slB=sliceAt(c.s2);
     const hw=k.hw, hb=0.35, ht=k.hTop;
     /* 底架 */
     quad(projPt(slA,xA+hw,0),projPt(slA,xA+hw,hb),
@@ -1438,7 +1445,7 @@ function drawTrain(t){
          fog([k.body[0]*0.55|0,k.body[1]*0.55|0,k.body[2]*0.55|0],d));
     /* 端面：面向攝影機的一端 (低里程端) */
     const isEndCar = c.i === (t.dir>0 ? k.cars-1 : 0);
-    if(isEndCar && c.s1 > S.pos){
+    if(isEndCar && c.s1 >= NEAR){
       const sl=slA, x=xA;
       quad(projPt(sl,x-hw,hb),projPt(sl,x-hw,ht),
            projPt(sl,x+hw,ht),projPt(sl,x+hw,hb),
