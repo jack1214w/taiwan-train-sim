@@ -438,9 +438,9 @@ function initAudio(){
   if(AC) return;
   try{
     AC = new (window.AudioContext||window.webkitAudioContext)();
-    /* VVVF 變頻器鳴音 (高頻哨音) */
+    /* VVVF 變頻器鳴音 (柔化的中頻，真實電車的哨音只是背景) */
     vvfOsc = AC.createOscillator(); vvfOsc.type='triangle';
-    const vf = AC.createBiquadFilter(); vf.type='lowpass'; vf.frequency.value=3400;
+    const vf = AC.createBiquadFilter(); vf.type='lowpass'; vf.frequency.value=1600;
     vvfGain = AC.createGain(); vvfGain.gain.value=0;
     vvfOsc.connect(vf); vf.connect(vvfGain); vvfGain.connect(AC.destination);
     vvfOsc.start();
@@ -466,17 +466,19 @@ function updAudio(){
   const kmh = S.v*3.6, now = AC.currentTime;
   const powering = S.notch>0 && S.doors==='closed' && !S.ebLatch;
   const braking  = (S.notch<0 || S.ebLatch) && S.v>0.8;   // 電軔再生音
-  /* VVVF 音高曲線：起步爬升 → 低速非同步載波分段 → 高速同步連續上升 */
+  /* VVVF 音高曲線 (整體降約一個八度，貼近真實電車)：
+     起步爬升 → 低速非同步載波分段 → 高速平緩上升 */
   let f;
-  if(kmh < 3)       f = 260 + kmh*90;
-  else if(kmh < 50) f = 320 + ((kmh % 16)/16)*640;
-  else              f = 380 + kmh*8.5;
-  vvfOsc.frequency.setTargetAtTime(f, now, 0.03);
+  if(kmh < 3)       f = 150 + kmh*45;
+  else if(kmh < 50) f = 185 + ((kmh % 16)/16)*300;
+  else              f = 230 + kmh*3.6;
+  vvfOsc.frequency.setTargetAtTime(f, now, 0.04);
   const cmd = S.ebLatch ? 1 : Math.abs(S.notch>0 ? S.notch/4 : S.notch/8);
-  const vg = (powering||braking) ? 0.016+0.014*cmd : 0;
-  vvfGain.gain.setTargetAtTime(vg, now, 0.08);
-  humOsc.frequency.setTargetAtTime(55 + kmh*5.5, now, 0.05);
-  humGain.gain.setTargetAtTime(S.v>0.3 ? 0.014 : 0, now, 0.1);
+  const vg = (powering||braking) ? 0.011+0.009*cmd : 0;
+  vvfGain.gain.setTargetAtTime(vg, now, 0.1);
+  /* 低頻馬達運轉聲為主體 */
+  humOsc.frequency.setTargetAtTime(42 + kmh*2.2, now, 0.05);
+  humGain.gain.setTargetAtTime(S.v>0.3 ? 0.022 : 0, now, 0.1);
   noiseGain.gain.setTargetAtTime(Math.min(0.13, S.v*0.005), now, 0.1);
 }
 function beep(freq, dur, vol){
